@@ -32,7 +32,7 @@ import math
 
 import torch
 import torch.nn.functional as F
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 from tqdm.auto import trange
 
 
@@ -152,6 +152,9 @@ def adamw_riesz_flow(initial_particles: torch.Tensor,
                      betas: Tuple[float, float] = (0.9, 0.95),
                      weight_decay: float = 0.0,
                      max_grad_norm: Optional[float] = None,
+                     noise_schedule: Optional[Callable[[int], float]] = None,
+                     noise_mode: str = "injected",
+                     generator: Optional[torch.Generator] = None,
                      normalize_scale: bool = True,
                      log_every: int = 100,
                      snapshot_every: Optional[int] = None,
@@ -192,6 +195,20 @@ def adamw_riesz_flow(initial_particles: torch.Tensor,
         iteration.
     snapshot_every : int, optional
         If given, stores a copy of the particles every `snapshot_every` iterations.
+    noise_schedule : callable step -> beta, optional
+        Noise level per iteration (see the schedules in `mmd_flow`). None disables
+        noise. Scales are in the units of the particle coordinates, so standardise
+        the latent first if its coordinates differ in scale.
+    noise_mode : {"injected", "additive"}
+        "injected" evaluates the loss at perturbed particles and applies the
+        resulting gradient to the unperturbed ones, which smooths the velocity
+        field and leaves the minimiser unchanged; "additive" perturbs the particle
+        state after the optimiser step, as in Langevin dynamics, which biases the
+        stationary law unless beta is annealed. Ignored when `noise_schedule` is
+        None. Note that AdamW rescales each coordinate by its gradient statistics,
+        so injected noise reaches the update only through that normalisation.
+    generator : torch.Generator, optional
+        Source of the noise, for reproducibility.
     verbose : bool
         Shows a progress bar.
 
@@ -202,6 +219,9 @@ def adamw_riesz_flow(initial_particles: torch.Tensor,
     """
     if lr_schedule not in ("const", "cosine"):
         raise ValueError("lr_schedule must be 'const' or 'cosine'")
+    if noise_mode not in ("injected", "additive"):
+        raise ValueError("noise_mode must be 'injected' or 'additive'")
+    injected = noise_mode == "injected"
     particles = initial_particles.detach().clone().requires_grad_(True)
     target = target.detach()
     optimizer = torch.optim.AdamW([particles], lr=learning_rate, betas=betas,
@@ -217,13 +237,26 @@ def adamw_riesz_flow(initial_particles: torch.Tensor,
         for group in optimizer.param_groups:
             group["lr"] = lr
 
+        beta = float(noise_schedule(step)) if noise_schedule is not None else 0.0
+        noise = None
+        if beta > 0.0:
+            noise = torch.randn(particles.shape, generator=generator,
+                                dtype=particles.dtype, device=particles.device)
+
         optimizer.zero_grad(set_to_none=True)
-        loss = riesz_energy_loss(particles, target, target_weights, sliced,
+        # Injected noise: the loss is read at x + beta u, but the gradient is taken
+        # with respect to x, so the update moves the unperturbed particle.
+        evaluated = particles + beta * noise if (noise is not None and injected) \
+            else particles
+        loss = riesz_energy_loss(evaluated, target, target_weights, sliced,
                                  num_projections, normalize_scale)
         loss.backward()
         if max_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_([particles], max_grad_norm)
         optimizer.step()
+        if noise is not None and not injected:
+            with torch.no_grad():
+                particles.add_(beta * noise)
 
         if snapshot_every is not None and step % snapshot_every == 0:
             history["snapshots"][step] = particles.detach().clone()

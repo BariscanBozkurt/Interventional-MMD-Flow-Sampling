@@ -18,6 +18,21 @@ where beta_n = 0 recovers plain gradient descent on the sample-based MMD. The
 gradient is evaluated at a blurred position but applied to the original particle,
 which helps escape local optima without changing the global optimum.
 
+Two noise mechanisms. `noise_mode="injected"` (the default, and the paper's
+Algorithm 1) perturbs only the point at which the witness gradient is evaluated:
+the particle state stays deterministic and the noise acts as a smoothing of the
+velocity field, so the minimiser of the objective is unchanged. `noise_mode=
+"additive"` instead perturbs the particle state itself,
+
+    x_i(n+1) = x_i(n) - gamma grad f(x_i(n)) + beta_n u_i(n),
+
+which is the diffusion used by (mean-field) Langevin dynamics. Additive noise
+keeps the particle law absolutely continuous and admits KL-type guarantees, but
+it biases the stationary law unless beta_n is annealed to zero. The two are not
+comparable at equal beta: injected noise displaces a particle only indirectly,
+through the change it induces in the gradient (order gamma * beta * curvature),
+whereas additive noise displaces it by beta per step.
+
 Counterfactual variant. The target may instead be a weighted kernel expansion
 chi_hat = sum_i v_i k(y_i, .), such as a doubly robust counterfactual policy mean
 embedding (Zenati, Bozkurt, Gretton, 2025) whose weights can be signed. Passing
@@ -146,6 +161,7 @@ def mmd_gradient_flow(kernel,
                       step_size: float = 0.1,
                       n_iterations: int = 10000,
                       noise_schedule: Optional[Callable[[int], float]] = None,
+                      noise_mode: str = "injected",
                       target_weights: Optional[torch.Tensor] = None,
                       log_every: int = 100,
                       snapshot_every: Optional[int] = None,
@@ -168,7 +184,12 @@ def mmd_gradient_flow(kernel,
     n_iterations : int
     noise_schedule : callable n -> beta_n, optional
         Noise level per iteration (see the schedule helpers below). None disables
-        noise injection.
+        noise entirely.
+    noise_mode : {"injected", "additive"}
+        Where beta_n acts (see the module docstring). "injected" perturbs the
+        gradient evaluation point and leaves the objective's minimiser unchanged;
+        "additive" perturbs the particle state, as in Langevin dynamics. Ignored
+        when `noise_schedule` is None.
     target_weights : torch.Tensor of shape (M,), optional
         Expansion weights of the target embedding. When given, the recorded
         objective is ||mu_Q - chi_hat||^2 instead of MMD^2.
@@ -189,6 +210,9 @@ def mmd_gradient_flow(kernel,
     particles : torch.Tensor of shape (N, d)
     history : dict with keys "iterations", "squared_mmd", "noise_levels", "snapshots".
     """
+    if noise_mode not in ("injected", "additive"):
+        raise ValueError("noise_mode must be 'injected' or 'additive'")
+    injected = noise_mode == "injected"
     particles = initial_particles.detach().clone()
     target_samples = target_samples.detach()
     history = {"iterations": [], "squared_mmd": [], "noise_levels": [], "snapshots": {}}
@@ -196,16 +220,18 @@ def mmd_gradient_flow(kernel,
     iterations = trange(n_iterations, desc="MMD flow") if verbose else range(n_iterations)
     for n in iterations:
         beta_n = float(noise_schedule(n)) if noise_schedule is not None else 0.0
+        noise = None
         if beta_n > 0.0:
             noise = torch.randn(particles.shape, generator=generator,
                                 dtype=particles.dtype, device=particles.device)
-            eval_points = particles + beta_n * noise
-        else:
-            eval_points = particles
+        eval_points = particles + beta_n * noise if (noise is not None and injected) \
+            else particles
 
         gradient = witness_gradient(kernel, particles, target_samples, eval_points,
                                     target_weights=target_weights)
         particles = particles - step_size * gradient
+        if noise is not None and not injected:
+            particles = particles + beta_n * noise
 
         if snapshot_every is not None and n % snapshot_every == 0:
             history["snapshots"][n] = particles.clone()
