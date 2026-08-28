@@ -42,14 +42,19 @@ this file is self-contained for other machines.
 src/
   kernel_utils/      Kernel, LengthScaleKernel (self-locking median heuristic),
                      RBF, RieszKernel, IMQKernel + imq_c_from_median; pairwise
-                     distances (eps-guarded sqrt for autograd)
+                     distances (eps-guarded sqrt for autograd);
+                     EncoderPullbackKernel (k(E(y),E(y')) through a frozen
+                     differentiable encoder — flows in outcome space)
   mmd_flow_utils/    mmd_flow.py: squared_mmd, embedding_squared_distance,
                      witness_gradient, mmd_gradient_flow (Arbel Alg. 1 +
                      weighted-target variant), noise schedules
                      riesz_flow.py: riesz_energy_loss (dense+sliced),
                      adamw_riesz_flow with lr_schedule in {const, cosine},
                      warm-up helpers
-  causality_utils/   cpme.py: plug-in / DR / cross-fitted DR weights
+  causality_utils/   herding.py: kernel_herding (Algorithm 2) + evaluate_embedding
+                     + herding_diagnostics (unique/multiplicity/coverage — herding
+                     selects WITH REPLACEMENT and can quantise);
+                     cpme.py: plug-in / DR / cross-fitted DR weights
                      (cpme_dr_weights_crossfit; reduces to full-sample formula
                      when the training block is everything; degenerate folds
                      raise), select_regularization (returns (lambda, weights)
@@ -85,6 +90,10 @@ NotebookExamples/
   dgp_analysis/      Design-characterisation notebooks, no estimators:
                      DecFM_2D_Mixture, ColorMNIST, CelebA (verified statistics)
   Interventional_MMD_Flow/   Method notebooks (see inventory below)
+  KernelHerdingSampler/      The selection-based sampler (Algorithm 2 of the CPME
+                     paper) on the same targets, for comparison: dSprites and
+                     CelebA female, each reusing its flow notebook's estimation
+                     cells verbatim and running the flow in-notebook
 Simulations/         Empty; multi-seed simulation scripts go here later
 tests/               12-test unittest suite (cross-fitted DR weights,
                      continuous-action importance weights); run with
@@ -168,6 +177,40 @@ vs their 3 seeds).
   ESTIMATED embedding, so a lower objective can mean fitting estimation noise.
   Report distance to held-out references, never the objective. Default: noise off
   for this sampler.
+- **ColorMNIST pixel-space ablation**
+  (`ColorMNIST_DR_IMQ_MMD_Flow_Euler_Pixel_Space_Ablation`, user-proposed): the
+  flow run in PIXEL space through `kernel_utils.EncoderPullbackKernel`
+  (k_E(y,y') = k(E(y),E(y')); witness/flow code unchanged, gradient = J_E^T
+  latent gradient via autograd; verified bitwise + chain-rule-exact). The
+  ESTIMATION half is untouched — the outcome kernel enters only the sampler, so
+  the same DR weights are reused and both parametrisations minimise the SAME
+  objective, making their values directly comparable.
+  THE IMAGE-DOMAIN CONSTRAINT: the decoder ends in a tanh, so the latent flow
+  keeps y in [-1,1] for free and the pixel flow does not (it reaches
+  [-1.70, 1.04]). Clamping after each step fixes the range but barely helps
+  (colour 0.654, SW2 0.0418) and worsens the AE gap to 6.18; REPARAMETRISING
+  y = tanh(w) — pull back through the composite encoder E o tanh, no flow code
+  changes — is the right fix and is the notebook's MAIN RUN: colour
+  0.728 -> 0.578, SW2 0.0504 -> 0.0255, in range by construction.
+  RESULT: even so, the flow plateaus. Over a 100x step sweep the objective falls
+  3.3e-04 -> 2.4e-06 while colour flattens at 0.576 and SW2 at 0.0253. It
+  converges to a point that beats the latent companion on the shared objective
+  (4.99e-06 vs 9.60e-06) while 1.9x worse in pixel SW2 (0.0255 vs 0.0137) and
+  0.08 short on colour (vs 0.503, oracle 0.494); AE gap 5.02 with AND without the
+  constraint (natural 2.86, oracle draw 3.12, decoder-native 1.10) — the
+  constraint fixes the RANGE, not the MANIFOLD. ENCODER-FOOLING, visible as
+  diffuse structured texture over foreground and background in the amplified
+  perturbation grid. KERNEL CHOICE changes the symptom, not the diagnosis: IMQ
+  converges-but-fools (canonical, because it isolates the phenomenon); a Riesz
+  pullback DIVERGES at every step 0.003-3 (pixels to +/-900, SW2 worsening) —
+  measured, recorded in CODEX PULL-01, not kept as a notebook.
+  GOTCHA: under y = tanh(w) every kernel argument passes through tanh, THE
+  TARGET SUPPORT INCLUDED — pass the target as atanh(y.clamp(+/-0.999)) or the
+  flow chases images compressed into [-0.76, 0.76].
+  LESSON: the latent sampler works because the DECODER projects moves onto the
+  image manifold, not because of the objective — and this now holds under a
+  valid image-domain constraint, so it is not a divergence artefact. Evidence:
+  CODEX PULL-01.
 - **ColorMNIST init ablation** (`..._Init_Ablation`): observed init beats
   N(0,I) and N(mu,Sigma) everywhere; the cycle error ||enc(dec(z))-z||
   separates them (1.0 vs ~3.3/3.0) — matching the mean embedding does NOT give
@@ -203,6 +246,31 @@ vs their 3 seeds).
   (truncation size 2000 vs 1126; different disjoint reference draw) — do not
   read those shifts as effects of n. Transport grows 4.5 -> 13.2 (richer
   target support); trajectory converges below the split floor by ~400 iters.
+- **CelebA female init ablation** (`..._Female_Init_Ablation`, 4 flows): observed arm vs
+  logged marginal P_Y vs N(0,I) vs N(mu,Sigma), pipeline otherwise identical. KEY: all
+  four reach the SAME latent SW2 (0.0745-0.0751) and the same final loss — the objective
+  is blind to the init — while decoded quality differs 2x: pixel SW2 0.0369 (marginal),
+  0.0376 (observed), 0.0441 (N(mu,Sigma)), 0.0759 (N(0,I), WORSE than the 0.0521 of no
+  flow at all). The cycle error ||enc(dec(z))-z|| is monotone in that ordering (7.69 /
+  9.42 / 11.45 / 13.56; raw observed latents 7.42) — matching a mean embedding does NOT
+  put particles on the decoder's manifold. Moment matching is not enough (exact mean AND
+  covariance still smears). POSITIVE: P_Y is as good as the arm-conditioned start, so the
+  DR target carries arm selection itself. Two design points: the flow works in
+  STANDARDISED coordinates so N(0,I) already matches per-coordinate moments (not a
+  strawman), and d=4096 > n=2048 makes Sigma_hat singular, so N(mu,Sigma) is sampled
+  exactly as mu + C^T g / sqrt(n-1), never via a ridged Cholesky. Evidence: CODEX INIT-01.
+- **KernelHerdingSampler/CelebA_DR_Kernel_Herding_Female** (herding vs the flow,
+  same run): herding is COMPETITIVE, contrary to expectation — pixel SW2 0.0387 vs
+  the flow's 0.0376 (base 0.0521, floor 0.0399); latent SW2 0.0774 vs 0.0747
+  (floor 0.0769). NO quantisation here (938/1024 distinct, max multiplicity 2 —
+  unlike dSprites' 372/1000 and 35), because the pool is 2x the sample and the
+  energy kernel repels strongly in 4096-d. The embedding localises on its own arm
+  unprompted: candidates were both arms (45% male), selection is 99.2% female.
+  KEY ADVANTAGE OF SELECTION: outputs are real logged photographs with known
+  labels, so the intervention is verified EXACTLY without a probe — blond fraction
+  0.491 -> 0.349 against the estimator's target 0.300 (~3/4 of the correction).
+  Herding produces no face absent from the log; here the target is a reweighting
+  of the logged sample, so that suffices. Evidence: CODEX HERD-01.
 - **Figure-4 comparability lives INSIDE the 256px notebooks**: a "64 x 64
   evaluation" block area-downsamples the same samples + references to 64px
   (the paper's resolution; the [-1,1] range matches natively — the caches
@@ -226,10 +294,19 @@ vs their 3 seeds).
   continuous 2D action, denoising AE latent 32 trained on the full sprite bank,
   fully cross-fitted DR: estimated linear-Gaussian logging density + per-fold
   CME ridge on shared folds, Riesz+AdamW 2000 iters lr 0.01 warmup 100): the
-  flow matches the interventional position law AT the 10-fresh-oracle-draw
-  floor on every metric (energy 0.047+/-0.012 vs floor 0.049+/-0.025; SW1
-  0.563 vs 0.564; SW2 0.705 vs 0.681; logged base 3.99/5.49/6.32), estimated
-  ratios ESS 236 log-RMSE 0.077, off-manifold tail ~4%. Euler baseline is
+  flow matches the interventional POSITION law at the 10-fresh-oracle-draw
+  floor (energy 0.047 vs floor 0.049), estimated ratios ESS 236 log-RMSE
+  0.077, off-manifold tail ~4%. CAUTION: those position numbers are computed
+  on SNAPPED images (decoded image -> nearest clean bank sprite), which
+  discards decoding error. The notebook now ALSO reports the unsnapped PIXEL
+  law, where the flow does NOT reach the floor: energy 0.1141 vs floor 0.0352
+  (3.2x), SW2 0.0252 vs 0.0138 (1.8x), against a logged base of 0.6240/0.0523
+  and an AE round-trip row of 0.6519 (so the decoder itself costs little and
+  the transport is real). Quote both; never the snapped number alone. The
+  notebook is STRUCTURED this way: Sections 4-7 measure decoded images only
+  (pixel-space trajectory, pixel metric table, pixel-scored Euler baseline);
+  Section 8 "The Snapped View" holds all snapping (decoded-vs-snapped figure,
+  position-law table, position trajectory and scatter). Euler baseline is
   step-size fragile (0.05 stalls; 1.0 costs manifold fidelity) — and NOTE:
   large-step Euler's failure MAGNITUDE varies across AE training runs (debug
   run blew up, deploy run only degraded), so claim fragility, not blow-up.
@@ -264,6 +341,15 @@ vs their 3 seeds).
   the arm grows past the cap). The matched-M control was launched twice and
   killed both times. The caveat is written into that notebook's summary — run
   the control or keep the caveat, but do not quietly drop it.
+- UNEXPLAINED: in the init ablation's logged-marginal (P_Y) run, female-origin
+  particles have transport 0.02 (they do not move) while the same population
+  moves 4.5 from the arm-only start. Hypothesis: AdamW's per-coordinate
+  normalisation gives a near-zero NET update to particles near equilibrium
+  whose gradient oscillates. A plain-Euler run on the same init would settle
+  it. The user has said P_Y's weaker result is acceptable, so this is optional.
+- The P_Y subgroup split (female-origin 0.0586 / male-origin 0.0898) was
+  measured OUTSIDE the notebook. If it is to be quoted in the paper, it should
+  be re-run as a cell inside the init-ablation notebook.
 - Planned notebook the user named but has not requested yet: a ColorMNIST IPW
   sibling of the DR notebooks. (The noise ablation is DONE, both samplers.)
 - Nothing has ever been committed or pushed here — that is the user's call.
