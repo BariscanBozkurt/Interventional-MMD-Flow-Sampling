@@ -1,0 +1,28 @@
+Checking GPU status...
+Fri Sep  4 13:28:01 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.95.05              Driver Version: 580.95.05      CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA L40S                    On  |   00000000:61:00.0 Off |                    0 |
+| N/A   36C    P0             81W /  350W |       0MiB /  46068MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+Task ID: 5  ->  --n_obs 500  data seed 5   tag splitae   extra: 
+Environment: /nfs/ghome/live/bbozkurt/.conda/envs/torchnn/bin/python
+device: cuda   output: /nfs/ghome/live/bbozkurt/Desktop/Interventional-MMD-Gradient-Flow/ignored_files/Interventional-MMD-Flow-Sampling/Simulations/dSprites/dr_mmd_flow/results/dsprites_splitae_nobs500_shift0.2_sig0.5_gain3_noise0.05_ds5.csv
+[data_seed 5 repeat 0] pixel energy flow 0.3945 (logged 0.6615, clean floor 0.1474)   pos mean flow (18.5, 18.2) oracle (19.4, 17.6)   ESS 77/250   31s
+[data_seed 5 repeat 1] pixel energy flow 0.3827 (logged 0.7172, clean floor 0.1477)   pos mean flow (17.5, 17.1) oracle (19.3, 17.7)   ESS 95/250   28s
+[data_seed 5 repeat 2] pixel energy flow 0.3208 (logged 0.6244, clean floor 0.1384)   pos mean flow (18.3, 18.1) oracle (18.3, 18.5)   ESS 82/250   28s
+done: 3 rows -> /nfs/ghome/live/bbozkurt/Desktop/Interventional-MMD-Gradient-Flow/ignored_files/Interventional-MMD-Flow-Sampling/Simulations/dSprites/dr_mmd_flow/results/dsprites_splitae_nobs500_shift0.2_sig0.5_gain3_noise0.05_ds5.csv

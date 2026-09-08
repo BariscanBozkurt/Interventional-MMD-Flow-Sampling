@@ -1,0 +1,33 @@
+Checking GPU status...
+Mon Sep  7 21:23:22 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.159.03             Driver Version: 580.159.03     CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA A100-SXM4-40GB          On  |   00000000:17:00.0 Off |                    0 |
+| N/A   30C    P0             54W /  400W |       0MiB /  40960MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+node-local cache dir: /tmp/celeba_dgp_bbozkurt_3541686_7 (deleted on exit)
+/dev/sda1       439G   60G  357G  15% /
+Task ID: 7  ->  --n_obs 4096  data seed 1   tag riesz   extra:  --cache_dir /tmp/celeba_dgp_bbozkurt_3541686_7
+Environment: /nfs/ghome/live/bbozkurt/.conda/envs/torchnn/bin/python
+device: cuda   output: /nfs/ghome/live/bbozkurt/Desktop/Interventional-MMD-Gradient-Flow/ignored_files/Interventional-MMD-Flow-Sampling/Simulations/CelebA/dr_mmd_flow/results/celeba_riesz_sz256_nobs4096_M1024_arms01_ds1.csv
+[data_seed 1 repeat 0 arm 0] latent SW2 flow 0.0721 (initial 0.0976, floor 0.0751)   pixel SW2 flow 0.0376 (floor 0.0393)   sum_v 1.000   222s
+[data_seed 1 repeat 0 arm 1] latent SW2 flow 0.0758 (initial 0.0952, floor 0.0791)   pixel SW2 flow 0.0394 (floor 0.0439)   sum_v 1.001   222s
+[data_seed 1 repeat 1 arm 0] latent SW2 flow 0.0721 (initial 0.1162, floor 0.0751)   pixel SW2 flow 0.0380 (floor 0.0393)   sum_v 1.000   216s
+[data_seed 1 repeat 1 arm 1] latent SW2 flow 0.0758 (initial 0.0985, floor 0.0791)   pixel SW2 flow 0.0394 (floor 0.0439)   sum_v 1.001   216s
+[data_seed 1 repeat 2 arm 0] latent SW2 flow 0.0719 (initial 0.0959, floor 0.0751)   pixel SW2 flow 0.0369 (floor 0.0393)   sum_v 1.000   216s
+[data_seed 1 repeat 2 arm 1] latent SW2 flow 0.0758 (initial 0.1001, floor 0.0791)   pixel SW2 flow 0.0390 (floor 0.0439)   sum_v 1.001   216s
+done: 6 rows -> /nfs/ghome/live/bbozkurt/Desktop/Interventional-MMD-Gradient-Flow/ignored_files/Interventional-MMD-Flow-Sampling/Simulations/CelebA/dr_mmd_flow/results/celeba_riesz_sz256_nobs4096_M1024_arms01_ds1.csv

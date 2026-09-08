@@ -1,0 +1,16 @@
+Task ID: 23  ->  --n_obs 10000  data seed 3   tag twins   extra: 
+Environment: /nfs/ghome/live/bbozkurt/.conda/envs/torchnn/bin/python
+output: /nfs/ghome/live/bbozkurt/Desktop/Interventional-MMD-Gradient-Flow/ignored_files/Interventional-MMD-Flow-Sampling/Simulations/DecFM_2D/dr_mmd_flow/results/decfm2d_twins_nobs10000_M1000_gamma3_delta2_sig0.2_ds3.csv
+[data_seed 3 repeat 0 arm 0 rbf_euler  ] SW2 0.507 -> 0.144 (floor 0.100)   sum_v 0.984   218s
+[data_seed 3 repeat 0 arm 0 riesz_adamw] SW2 0.507 -> 0.159 (floor 0.100)   sum_v 0.984   217s
+[data_seed 3 repeat 0 arm 1 rbf_euler  ] SW2 0.503 -> 0.165 (floor 0.100)   sum_v 0.976   242s
+[data_seed 3 repeat 0 arm 1 riesz_adamw] SW2 0.503 -> 0.180 (floor 0.100)   sum_v 0.976   166s
+[data_seed 3 repeat 1 arm 0 rbf_euler  ] SW2 0.507 -> 0.134 (floor 0.100)   sum_v 0.989   246s
+[data_seed 3 repeat 1 arm 0 riesz_adamw] SW2 0.507 -> 0.152 (floor 0.100)   sum_v 0.989   216s
+[data_seed 3 repeat 1 arm 1 rbf_euler  ] SW2 0.503 -> 0.139 (floor 0.100)   sum_v 0.979   219s
+[data_seed 3 repeat 1 arm 1 riesz_adamw] SW2 0.503 -> 0.141 (floor 0.100)   sum_v 0.979   216s
+[data_seed 3 repeat 2 arm 0 rbf_euler  ] SW2 0.507 -> 0.101 (floor 0.100)   sum_v 0.985   220s
+[data_seed 3 repeat 2 arm 0 riesz_adamw] SW2 0.507 -> 0.127 (floor 0.100)   sum_v 0.985   159s
+[data_seed 3 repeat 2 arm 1 rbf_euler  ] SW2 0.503 -> 0.140 (floor 0.100)   sum_v 0.972   198s
+[data_seed 3 repeat 2 arm 1 riesz_adamw] SW2 0.503 -> 0.161 (floor 0.100)   sum_v 0.972   151s
+done: 12 rows -> /nfs/ghome/live/bbozkurt/Desktop/Interventional-MMD-Gradient-Flow/ignored_files/Interventional-MMD-Flow-Sampling/Simulations/DecFM_2D/dr_mmd_flow/results/decfm2d_twins_nobs10000_M1000_gamma3_delta2_sig0.2_ds3.csv

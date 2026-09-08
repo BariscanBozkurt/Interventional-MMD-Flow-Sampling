@@ -94,7 +94,11 @@ NotebookExamples/
                      paper) on the same targets, for comparison: dSprites and
                      CelebA female, each reusing its flow notebook's estimation
                      cells verbatim and running the flow in-notebook
-Simulations/         Empty; multi-seed simulation scripts go here later
+Simulations/         Multi-seed HPC simulation scripts, one dataset/method folder
+                     per experiment (ColorMNIST/dr_mmd_flow, dSprites/dr_mmd_flow,
+                     CelebA/dr_mmd_flow); each holds a CLI simulation script + a
+                     SLURM array submit script writing one self-describing CSV per
+                     task to results/
 tests/               12-test unittest suite (cross-fitted DR weights,
                      continuous-action importance weights); run with
                      `python -m unittest discover -s tests` from the repo root
@@ -332,11 +336,63 @@ vs their 3 seeds).
 
 - Add a requirements file before the first real commit (the 12-test suite is
   ported and passing under tests/). This is the last blocking item.
-- `Simulations/` is still empty. First concrete job: the 3-seed, n=20000, 64px
-  CelebA run at the DecFM paper's exact setting (generate_celeba_confounding's
-  defaults ARE those settings) — the only way to a real head-to-head with its
-  Figure 4. The dgp_analysis sweeps show large seed variance, so single-seed
-  results must not be read as design properties.
+- `Simulations/` now holds ColorMNIST and dSprites (2026-09-04, user-driven).
+  Shared conventions, follow them for new experiments: array ID = SEEDS_PER *
+  value_index + data_seed with a generic PARAM/VALUES sweep axis (override via
+  --export=ALL); pipeline_seed = 1000 * data_seed + repeat with the reference
+  notebook's seed offsets; one CSV per task, REWRITTEN after every repeat
+  (crash-safe); requested vs actual sizes both recorded; fail-fast data guards
+  (no downloads on compute nodes). ColorMNIST
+  (Simulations/ColorMNIST/dr_mmd_flow) mirrors the RefParams_SplitAE notebook,
+  runs BOTH arms per repeat on shared nuisances (verified on CPU: the arm-1 row
+  is bit-identical whether or not arm 0 runs first). dSprites
+  (Simulations/dSprites/dr_mmd_flow) mirrors the CrossFit_DR_Riesz notebook with
+  ONE deliberate change: the denoising AE trains on logged images from a
+  disjoint split (ae_fraction, default half of n_obs=2000), NOT on the sprite
+  bank — the bank is oracle knowledge and survives only in evaluation (probe,
+  snapping, clean floor, denoise MSE); denoising targets are the noisy logged
+  images themselves. Notebook-parity is by design, not by seed path, for
+  dSprites (the AE change breaks bitwise parity); metric scoring runs on the
+  GPU (CPU cdist at n_causal=4000 would take ~an hour per repeat). The Euler
+  baseline (notebook section 7) is NOT in the script. WEIGHT CLIPPING
+  (2026-09, from the first sweep's analysis): the estimated logging-density
+  ratio grows SPURIOUS tails on bad-overlap draws (est max weight 192 where
+  the oracle weights have ESS 126) — ~10 low-ESS runs of 150 drove the whole
+  seed envelope, same seeds bad in every repeat, est ESS < 50 predicted every
+  failure. `--weight_clip` (default 5.0, <=0 disables) caps the estimated
+  weights pre-DR; searched over {inf,20,10,5,2.5} x failing+healthy seeds:
+  5 repairs every failure (seed-9 n=500: 1.89+-2.27 -> 0.30+-0.04), leaves
+  healthy seeds unchanged (n=8000 seed 0 at the position floor), keeps the
+  position mean unbiased; 2.5 begins to UNDERSHOOT it (truncation bias).
+  Unclipped tails also biased the position mean UP (~20.0 vs oracle 18.5).
+  The first sweep's CSVs are unclipped; a relaunch overwrites them with the
+  clipped method (the executed analysis notebook documents the unclipped
+  state).
+- CelebA (Simulations/CelebA/dr_mmd_flow, 2026-09-04) follows the shared
+  conventions with three specifics: NO AE split (the SD-VAE is external and
+  frozen — the user's explicit call); encodings computed once per data seed
+  (pipeline-independent); data caches one .pt per
+  (image_size, n_obs, n_ref, data_seed), generated on first use from Hugh's raw
+  root on NFS and written ATOMICALLY (tmp + os.replace) so concurrent tasks
+  sharing a config can't corrupt them, with a legacy-name fallback for the
+  pre-existing caches. n_dr subsampling activates only when n_obs > n_dr
+  (identity order otherwise — exact notebook path at defaults). Eval on GPU,
+  native + 64px tables, latent SW2 with split-half floors. MEMORY: 256px fits
+  ~n_obs<=4096 at 24G; n=20000 requires --image_size 64. HF_HUB_OFFLINE=1 in
+  the submit script (weights already in the NFS HF cache). The DecFM Figure-4
+  head-to-head (3-seed, n=20000, 64px, generate_celeba_confounding's defaults
+  ARE those settings) is now one submit line — see the script header — but has
+  NOT yet been run. The dgp_analysis sweeps show large seed variance, so
+  single-seed results must not be read as design properties.
+- DecFM_2D calibration is SETTLED (2026-09-07 search at n=20000, recorded in
+  the analysis notebook): lr 5e-4 is the bottom of a sharp U (ratio-to-floor
+  3.44 / 2.01 / 1.52 / 2.35 / 4.55 across lr 1e-4..5e-3); more iterations
+  overshoot the same way; n_dr 8000 buys ~2% at 2x flow cost. Keep the
+  defaults — the ~1.5x-floor plateau is DR-target estimation error, not
+  calibration. Also: the 2D floor is a PER-DRAW quantity (varies with seed AND
+  n), so raw cross-n SW2 comparisons mislead — the analysis notebook's
+  excess/ratio panels are the fair view (a raw "uptick" at n=20000 was exactly
+  this artefact).
 - UNVERIFIED: the male n=16384 gain is confounded with M (922 -> 1024, because
   the arm grows past the cap). The matched-M control was launched twice and
   killed both times. The caveat is written into that notebook's summary — run

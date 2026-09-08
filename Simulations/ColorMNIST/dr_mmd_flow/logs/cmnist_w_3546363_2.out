@@ -1,0 +1,31 @@
+Checking GPU status...
+Tue Sep  8 14:38:10 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.95.05              Driver Version: 580.95.05      CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA H100 80GB HBM3          On  |   00000000:4E:00.0 Off |                    0 |
+| N/A   34C    P0             70W /  700W |       0MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+Task ID: 2  ->  --w_conf 1  data seed 2   tag wsweep   extra: 
+Environment: /nfs/ghome/live/bbozkurt/.conda/envs/torchnn/bin/python
+device: cuda   output: /nfs/ghome/live/bbozkurt/Desktop/Interventional-MMD-Gradient-Flow/ignored_files/Interventional-MMD-Flow-Sampling/Simulations/ColorMNIST/dr_mmd_flow/results/colormnist_wsweep_nobs20000_M1600_w1_a0_k10_tau0.08_arms01_ds2.csv
+[data_seed 2 repeat 0 arm 0] colour flow 0.495 (initial 0.454, oracle 0.514)   SW2 flow 0.0069 (floor 0.0059)   ESS 1932/1984   36s
+[data_seed 2 repeat 0 arm 1] colour flow 0.500 (initial 0.542, oracle 0.514)   SW2 flow 0.0094 (floor 0.0079)   ESS 1965/2016   36s
+[data_seed 2 repeat 1 arm 0] colour flow 0.498 (initial 0.454, oracle 0.511)   SW2 flow 0.0074 (floor 0.0060)   ESS 1911/1951   34s
+[data_seed 2 repeat 1 arm 1] colour flow 0.501 (initial 0.547, oracle 0.511)   SW2 flow 0.0106 (floor 0.0083)   ESS 2010/2049   34s
+[data_seed 2 repeat 2 arm 0] colour flow 0.496 (initial 0.447, oracle 0.498)   SW2 flow 0.0068 (floor 0.0064)   ESS 1966/1999   34s
+[data_seed 2 repeat 2 arm 1] colour flow 0.512 (initial 0.549, oracle 0.498)   SW2 flow 0.0095 (floor 0.0081)   ESS 1969/2001   34s
+done: 6 rows -> /nfs/ghome/live/bbozkurt/Desktop/Interventional-MMD-Gradient-Flow/ignored_files/Interventional-MMD-Flow-Sampling/Simulations/ColorMNIST/dr_mmd_flow/results/colormnist_wsweep_nobs20000_M1600_w1_a0_k10_tau0.08_arms01_ds2.csv
