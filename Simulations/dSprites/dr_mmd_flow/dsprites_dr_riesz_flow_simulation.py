@@ -47,8 +47,9 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.append(str(REPO_ROOT / "src"))
 
-from causality_utils import (cpme_dr_weights_crossfit, make_crossfit_fold_ids,
-                             select_regularization)
+from causality_utils import (cpme_dr_weights_crossfit,
+                             cpme_dr_weights_crossfit_nystrom,
+                             make_crossfit_fold_ids, select_regularization)
 from data_utils import load_dsprite_bank, sample_cpme_dsprite_data
 from dens_ratio_utils import (crossfit_logging_policy_log_prob,
                               importance_weight_diagnostics,
@@ -64,12 +65,13 @@ POSITION_ROWS = ("logged", "flow", "floor")
 METRICS = ("energy", "sw1", "sw2")
 
 COLUMNS = (
-    ["tag", "device", "data_seed", "repeat", "pipeline_seed",
+    ["tag", "device", "init", "data_seed", "repeat", "pipeline_seed",
      "n_obs", "sigma_policy", "policy_shift", "pos_gain", "pixel_noise",
      "n_ae", "n_causal", "n_folds", "n_resample", "n_ref",
      "latent_dim", "ae_iterations", "flow_iterations", "learning_rate", "warmup_steps",
      "ae_train_mse", "denoise_mse_logged", "probe_r2_x", "probe_r2_y",
-     "weight_clip", "oracle_w_ess", "est_w_ess", "est_w_max", "est_w_log_rmse",
+     "weight_clip", "solver", "n_landmarks",
+     "oracle_w_ess", "est_w_ess", "est_w_max", "est_w_log_rmse",
      "lengthscale_x", "lengthscale_a", "fold_lambdas", "sum_v", "sum_abs_v",
      "reweighted_pos_x", "reweighted_pos_y",
      "loss_initial", "loss_final", "mean_transport",
@@ -104,6 +106,34 @@ def write_rows(out_path: Path, rows: list) -> None:
         tmp.unlink(missing_ok=True)
         raise
 
+
+def resolve_solver(args) -> str:
+    """Which ridge solver this configuration uses; see --solver."""
+    if args.solver != "auto":
+        return args.solver
+    return "exact" if args.n_obs <= args.exact_max_n_obs else "nystrom"
+
+
+def gaussian_init(reference, n_particles: int, mode: str,
+                  generator) -> "torch.Tensor":
+    """Particles from N(0, I) or the reference sample's empirical N(mu, Sigma).
+
+    The moment-matched draw uses the CENTRED DATA MATRIX rather than a D x D
+    Cholesky: for centred Z (n, D) and g ~ N(0, I_n), Z^T g / sqrt(n - 1) has
+    exactly the sample covariance. That costs O(n D), needs no jitter, and stays
+    well defined when n < D (the empirical Gaussian is then degenerate on the
+    data span, which is the correct object). `reference` is the flow's own target
+    support, so both draws live in the coordinates the flow operates in.
+    """
+    n, dim = reference.shape
+    if mode == "normal":
+        return torch.randn(n_particles, dim, generator=generator,
+                           device=reference.device, dtype=reference.dtype)
+    mean = reference.mean(dim=0, keepdim=True)
+    weights = torch.randn(n_particles, n, generator=generator,
+                          device=reference.device, dtype=reference.dtype)
+    return mean + weights @ (reference - mean) / (n - 1) ** 0.5
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     parser.add_argument("--n_obs", type=int, default=2000,
@@ -127,6 +157,29 @@ def parse_args() -> argparse.Namespace:
                              "over {inf, 20, 10, 5, 2.5} x failing+healthy seeds: 5 repairs "
                              "every failure, leaves healthy seeds unchanged, and keeps the "
                              "position mean unbiased; 2.5 begins to undershoot it.")
+    parser.add_argument("--init", type=str, default="observed",
+                        choices=("observed", "normal", "moment"),
+                        help="initial particles: 'observed' = the logged arm (default), "
+                             "'normal' = N(0, I), 'moment' = the empirical N(mu, Sigma) "
+                             "of the flow's target support. Both Gaussians are drawn in "
+                             "the coordinates the flow operates in. NOTE: the *_initial "
+                             "metric columns describe the run's actual starting cloud, so "
+                             "under a Gaussian init they are not the observed-arm baseline "
+                             "-- take that from the matching --init observed run.")
+    parser.add_argument("--solver", type=str, default="auto",
+                        choices=("auto", "exact", "nystrom"),
+                        help="how each fold's CME ridge system is solved. 'auto' (default) "
+                             "solves exactly while affordable and switches to Nystrom above "
+                             "--exact_max_n_obs. The DR support is the whole causal split "
+                             "either way, so the solver is a tractability detail, not a "
+                             "method variant. Keyed on n_obs so runs compared at the same "
+                             "n_obs always share a solver. NOTE the causal split is "
+                             "n_obs/2 here, so the current grid never leaves the exact "
+                             "regime at the default ae_fraction.")
+    parser.add_argument("--exact_max_n_obs", type=int, default=10000,
+                        help="largest n_obs for which 'auto' solves exactly")
+    parser.add_argument("--n_landmarks", type=int, default=1024,
+                        help="Nystrom landmarks per fold")
     parser.add_argument("--n_folds", type=int, default=5)
     parser.add_argument("--n_resample", type=int, default=8,
                         help="target-policy draws averaged into the target action kernel")
@@ -157,9 +210,10 @@ def parse_args() -> argparse.Namespace:
 def csv_path(args: argparse.Namespace) -> Path:
     """One CSV per task, its name carrying the swept constants and the seed block."""
     seeds = "-".join(str(seed) for seed in args.data_seeds)
+    suffix = "" if args.init == "observed" else f"_init{args.init}"
     name = (f"dsprites_{args.tag}_nobs{args.n_obs}_shift{args.policy_shift:g}"
             f"_sig{args.sigma_policy:g}_gain{args.pos_gain:g}_noise{args.pixel_noise:g}"
-            f"_ds{seeds}.csv")
+            f"_ds{seeds}{suffix}.csv")
     return Path(args.out_dir) / name
 
 
@@ -256,14 +310,26 @@ def run_repeat(sprite_bank: np.ndarray, bank_flat: torch.Tensor,
         K_a_target += kernel_a(A_t, torch.as_tensor(A_resample, dtype=torch.float64))
     K_a_target /= args.n_resample
 
+    solver = resolve_solver(args)
     K_pair = K_x * K_a
     fold_lambdas = {}
     for fold in np.unique(fold_ids):
         train = np.where(fold_ids != fold)[0]
-        fold_lambdas[int(fold)], _ = select_regularization(K_pair[train][:, train],
-                                                           Z_log[train, 0].double(), seed=0)
+        # lambda does not need the full training block, which is itself an n^3 solve
+        pick = train[torch.randperm(len(train),
+                                    generator=torch.Generator().manual_seed(0))[:2000].numpy()]
+        fold_lambdas[int(fold)], _ = select_regularization(K_pair[np.ix_(pick, pick)],
+                                                           Z_log[pick, 0].double(), seed=0)
     w_t = torch.as_tensor(w_hat, dtype=torch.float64)
-    v_dr = cpme_dr_weights_crossfit(K_x, K_a, K_a_target, w_t, fold_ids, fold_lambdas)
+    if solver == "nystrom":
+        K_pi = K_x * K_a_target
+        gram = lambda rows, cols: K_pair[np.ix_(np.asarray(rows), np.asarray(cols))]
+        gram_pi = lambda rows, cols: K_pi[np.ix_(np.asarray(rows), np.asarray(cols))]
+        v_dr = cpme_dr_weights_crossfit_nystrom(
+            gram, gram_pi, w_t, fold_ids, fold_lambdas, n_landmarks=args.n_landmarks,
+            generator=torch.Generator().manual_seed(seed))
+    else:
+        v_dr = cpme_dr_weights_crossfit(K_x, K_a, K_a_target, w_t, fold_ids, fold_lambdas)
     seconds_nuisance = time.time() - t0
 
     # -- Riesz MMD flow (AdamW, warm-up) on standardized latents -----------------------
@@ -273,9 +339,15 @@ def run_repeat(sprite_bank: np.ndarray, bank_flat: torch.Tensor,
     to_flow = lambda z: ((z - latent_mean) / latent_std).float()
     from_flow = lambda z: z.cpu().float() * latent_std + latent_mean
 
-    initial_particles = to_flow(Z_log).to(device)
+    flow_target = to_flow(Z_log).to(device)      # the logged latents: always the target
+    if args.init == "observed":
+        initial_particles = flow_target.clone()
+    else:
+        initial_particles = gaussian_init(
+            flow_target, flow_target.shape[0], args.init,
+            torch.Generator(device=device).manual_seed(seed + 3))
     flow_particles, flow_info = adamw_riesz_flow(
-        initial_particles, initial_particles.clone(),
+        initial_particles, flow_target,
         target_weights=v_dr.float().to(device), sliced=False,
         n_iterations=args.flow_iterations, learning_rate=args.learning_rate,
         warmup_steps=args.warmup_steps, log_every=500, verbose=False)
@@ -320,7 +392,7 @@ def run_repeat(sprite_bank: np.ndarray, bank_flat: torch.Tensor,
                         "floor": pos_target}
 
     row = {
-        "tag": args.tag, "device": str(device),
+        "tag": args.tag, "device": str(device), "init": args.init,
         "data_seed": data_seed, "repeat": repeat, "pipeline_seed": seed,
         "n_obs": args.n_obs, "sigma_policy": args.sigma_policy,
         "policy_shift": args.policy_shift, "pos_gain": args.pos_gain,
@@ -334,6 +406,8 @@ def run_repeat(sprite_bank: np.ndarray, bank_flat: torch.Tensor,
         "probe_r2_x": float(probe["posX_r2"]), "probe_r2_y": float(probe["posY_r2"]),
         "weight_clip": (args.weight_clip if args.weight_clip is not None
                         and args.weight_clip > 0 else float("inf")),
+        "solver": solver,
+        "n_landmarks": args.n_landmarks if solver == "nystrom" else 0,
         "oracle_w_ess": float(oracle_diag["ess"]), "est_w_ess": float(diag["ess"]),
         "est_w_max": float(diag["max"]), "est_w_log_rmse": float(diag["log_rmse"]),
         "lengthscale_x": float(kernel_x.length_scale),

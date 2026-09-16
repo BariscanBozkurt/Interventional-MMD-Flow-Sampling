@@ -47,14 +47,19 @@ class DspriteAE(nn.Module):
         probe is what predicts kernel feature quality. Default 32.
     base_channels : int
         Channel width of the first conv (doubled at the next two stages).
+    in_channels : int
+        1 for the grayscale design, 3 for the coloured variant whose sprite hue
+        is set by the action.
     """
 
-    def __init__(self, latent_dim: int = 32, base_channels: int = 32):
+    def __init__(self, latent_dim: int = 32, base_channels: int = 32,
+                 in_channels: int = 1):
         super().__init__()
         c = base_channels
         self.base_channels = c
+        self.in_channels = in_channels
         self.encoder = nn.Sequential(
-            nn.Conv2d(1, c, 4, 2, 1), _group_norm(c), nn.SiLU(),                # 64 -> 32
+            nn.Conv2d(in_channels, c, 4, 2, 1), _group_norm(c), nn.SiLU(),      # 64 -> 32
             nn.Conv2d(c, 2 * c, 4, 2, 1), _group_norm(2 * c), nn.SiLU(),        # 32 -> 16
             nn.Conv2d(2 * c, 4 * c, 4, 2, 1), _group_norm(4 * c), nn.SiLU(),    # 16 -> 8
             nn.Conv2d(4 * c, 4 * c, 4, 2, 1), _group_norm(4 * c), nn.SiLU(),    # 8 -> 4
@@ -65,15 +70,15 @@ class DspriteAE(nn.Module):
             nn.ConvTranspose2d(4 * c, 4 * c, 4, 2, 1), _group_norm(4 * c), nn.SiLU(),  # 4 -> 8
             nn.ConvTranspose2d(4 * c, 2 * c, 4, 2, 1), _group_norm(2 * c), nn.SiLU(),  # 8 -> 16
             nn.ConvTranspose2d(2 * c, c, 4, 2, 1), _group_norm(c), nn.SiLU(),          # 16 -> 32
-            nn.ConvTranspose2d(c, 1, 4, 2, 1), nn.Sigmoid(),                           # 32 -> 64
+            nn.ConvTranspose2d(c, in_channels, 4, 2, 1), nn.Sigmoid(),                  # 32 -> 64
         )
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Images (n, 1, 64, 64) -> latent features (n, latent_dim)."""
+        """Images (n, in_channels, 64, 64) -> latent features (n, latent_dim)."""
         return self.to_latent(self.encoder(x).flatten(1))
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """Latent features (n, latent_dim) -> images (n, 1, 64, 64) in [0, 1]."""
+        """Latent features (n, latent_dim) -> images (n, in_channels, 64, 64) in [0, 1]."""
         h = self.from_latent(z).view(-1, 4 * self.base_channels, 4, 4)
         return self.decoder(h)
 
@@ -84,6 +89,7 @@ class DspriteAE(nn.Module):
 def train_dsprite_ae(clean_images: torch.Tensor,
                      latent_dim: int = 32,
                      base_channels: int = 32,
+                     in_channels: Optional[int] = None,
                      noise_std: float = 0.05,
                      n_iterations: int = 4000,
                      batch_size: int = 128,
@@ -113,7 +119,9 @@ def train_dsprite_ae(clean_images: torch.Tensor,
     if device is None:
         device = clean_images.device
     clean_images = clean_images.to(device)
-    net = DspriteAE(latent_dim=latent_dim, base_channels=base_channels).to(device)
+    channels = in_channels if in_channels is not None else clean_images.shape[1]
+    net = DspriteAE(latent_dim=latent_dim, base_channels=base_channels,
+                    in_channels=channels).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=learning_rate)
     n = clean_images.shape[0]
     history = []

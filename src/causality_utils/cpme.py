@@ -208,3 +208,115 @@ def select_regularization(K: torch.Tensor,
     cv_errors = torch.stack(cv_errors)
     best_lambda = float(lambda_grid[int(cv_errors.argmin())])
     return best_lambda, cv_errors
+
+
+def _blocked_rhs(gram, gram_pi, train, held_out, importance_weights, block: int = 2048):
+    """(K_pi[T, H] 1 - K[T, H] w_H), accumulated over column blocks of H.
+
+    Materialising the whole (|T|, |H|) block is what makes the exact solver run out
+    of memory at n = 20000; the right-hand side only ever needs column sums, so it
+    is accumulated a slice at a time.
+    """
+    total = None
+    for start in range(0, len(held_out), block):
+        columns = held_out[start:start + block]
+        piece = (gram_pi(train, columns).sum(dim=1)
+                 - gram(train, columns) @ importance_weights[columns])
+        total = piece if total is None else total + piece
+    return total
+
+
+def cpme_dr_weights_crossfit_nystrom(gram,
+                                     gram_pi,
+                                     importance_weights: torch.Tensor,
+                                     fold_ids,
+                                     reg_lambda,
+                                     n_landmarks: int = 1024,
+                                     generator: Optional[torch.Generator] = None,
+                                     jitter: float = 1e-8) -> torch.Tensor:
+    """
+    Nystrom-approximated cross-fitted doubly robust CPME weights.
+
+    The estimator is the one of `cpme_dr_weights_crossfit`; only each fold's ridge
+    solve is approximated. With m landmarks L drawn from that fold's training block
+    T and U = K[T, L],
+
+        K_TT ~= U K_LL^{-1} U^T,
+        (U K_LL^{-1} U^T + lambda I)^{-1} r
+            = (1/lambda) [ r - U (lambda K_LL + U^T U)^{-1} U^T r ]
+
+    by Woodbury, so a fold costs O(|T| m^2 + m^3) instead of O(|T|^3) and no
+    |T| x |T| matrix is formed. That is what makes the DR support the whole logged
+    sample rather than a few thousand rows.
+
+    Taking L = T recovers the exact solver up to floating point.
+
+    Parameters
+    ----------
+    gram, gram_pi : callable
+        `gram(rows, cols)` returns the (len(rows), len(cols)) block of
+        K = K_X * K_A; `gram_pi` the corresponding block of K_pi = K_X * K_A_pi.
+        Blocks are computed on demand so the full Gram never exists.
+    importance_weights : torch.Tensor of shape (n,)
+        Cross-fitted weights, evaluated out-of-fold with the same `fold_ids`.
+    fold_ids : array-like of shape (n,)
+    reg_lambda : float or dict {fold: float}
+    n_landmarks : int
+        Landmarks per fold, capped at the training-block size.
+    generator : torch.Generator, optional
+        Draws the landmark subsets.
+    jitter : float
+        Relative eigenvalue floor for the landmark Gram: components below
+        `jitter * max eigenvalue` are dropped when whitening.
+
+    Returns
+    -------
+    torch.Tensor of shape (n,)
+    """
+    import numpy as np
+
+    fold_ids = np.asarray(fold_ids).reshape(-1)
+    n = len(fold_ids)
+    if importance_weights.shape[0] != n:
+        raise ValueError("importance_weights and fold_ids disagree on n")
+    folds = np.unique(fold_ids)
+    if len(folds) < 2:
+        raise ValueError("fold_ids must contain at least two folds")
+
+    weights = importance_weights
+    v = torch.zeros(n, dtype=weights.dtype, device=weights.device)
+    for fold in folds:
+        held_out = np.where(fold_ids == fold)[0]
+        train = np.where(fold_ids != fold)[0]
+        if len(train) < 2:
+            raise ValueError("every fold must leave at least two training observations")
+        lam = reg_lambda[int(fold)] if isinstance(reg_lambda, dict) else reg_lambda
+
+        rhs = _blocked_rhs(gram, gram_pi, train, held_out, weights)
+        m = min(n_landmarks, len(train))
+        order = torch.randperm(len(train), generator=generator)[:m].numpy()
+        landmarks = train[np.sort(order)]
+
+        U = gram(train, landmarks)                       # (|T|, m)
+        K_ll = gram(landmarks, landmarks)                # (m, m)
+
+        # Whitened Nystrom features. The naive Woodbury form
+        # (1/lam)[r - U (lam K_LL + U^T U)^{-1} U^T r] is algebraically right but
+        # numerically poor: it squares the Gram's condition number and the 1/lam
+        # prefactor amplifies whatever survives, so a small selected lambda
+        # (select_regularization searches down to 1e-4) can destroy the weights
+        # entirely. Factoring K_LL = V diag(s) V^T and setting Phi = U V s^{-1/2}
+        # gives K_TT ~= Phi Phi^T with the SAME approximation but an inner system
+        # lam I + Phi^T Phi that stays well conditioned for any lambda.
+        eigenvalues, eigenvectors = torch.linalg.eigh(K_ll)
+        keep = eigenvalues > jitter * float(eigenvalues.max().clamp_min(0.0))
+        if not bool(keep.any()):
+            raise ValueError("landmark Gram is numerically zero")
+        eigenvalues, eigenvectors = eigenvalues[keep], eigenvectors[:, keep]
+        phi = U @ (eigenvectors / eigenvalues.sqrt())    # (|T|, k)
+        inner = (phi.T @ phi
+                 + lam * torch.eye(phi.shape[1], dtype=phi.dtype, device=phi.device))
+        correction = phi @ torch.linalg.solve(inner, phi.T @ rhs)
+        v[train] += (rhs - correction) / (lam * n)
+        v[held_out] += weights[held_out] / n
+    return v

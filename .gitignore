@@ -222,3 +222,23 @@ src/other_methods/
 
 # Dataset downloads
 /data/
+
+# SLURM array logs (one .out/.err per task; the CSVs under results/ are the record)
+Simulations/*/dr_mmd_flow/logs/
+*.out
+*.err
+slurm-*.out
+
+# Test suite (kept private for now)
+tests/
+
+# SLURM submit scripts (cluster-specific paths and partitions; kept private)
+*.sh
+
+# Agent handoff notes (not part of the published code)
+CLAUDE.md
+
+# Archived simulation results: superseded runs, kept locally for reference only.
+# The whole folder is ignored, READMEs included.
+Simulations/*/dr_mmd_flow/results_archive_*/
+results_archive_*/
