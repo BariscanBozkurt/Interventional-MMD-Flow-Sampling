@@ -19,7 +19,11 @@ nuisance diagnostics (on-arm ESS, sum of DR weights, per-fold lambdas), flow
 diagnostics (bandwidth, step, objective at start and end) and the pixel-space
 evaluation against fresh oracle draws (colour-ratio law, latent SW2, pixel SW1, SW2,
 RBF MMD^2) for
-the initial particles, the flowed particles, and the oracle-vs-oracle floor.
+the initial particles, the flowed particles, and the oracle-vs-oracle floor. Every
+cheap distributional floor also gets a `*_floor_matched` twin computed on both oracle
+draws subsampled to the count the row's own sample was scored at, because those metrics
+are sample-size biased and a particle-count sweep would otherwise move the rows while
+the floor stood still.
 
 Evaluation protocol (2026-09-15, matched to Dance et al.): no autoencoder split
 (--ae_split none: the AE trains on the whole logged sample and the DR support is
@@ -57,15 +61,18 @@ from data_utils import (color_ratio, load_digit_pools, sample_interventional,
                         sample_observed, to_image_range, to_model_range)
 from autoencoder_utils import encode_in_batches, train_conv_ae
 from kernel_utils import IMQKernel, RBF, imq_c_from_median
-from causality_utils import (cpme_dr_weights_crossfit,
-                             cpme_dr_weights_crossfit_nystrom,
+from causality_utils import (cpme_dr_weights, cpme_dr_weights_crossfit,
+                             cpme_dr_weights_crossfit_nystrom, cpme_dr_weights_nystrom,
+                             cpme_dr_weights_crossfit_projected_nystrom,
+                             cpme_dr_weights_projected_nystrom,
+                             lambda_n_half,
                              make_crossfit_fold_ids, select_regularization)
-from dens_ratio_utils import crossfit_propensity
+from dens_ratio_utils import LogisticPropensityModel, crossfit_propensity
 from mmd_flow_utils import mmd_gradient_flow, squared_mmd
 from metric_utils import CleanFIDScorer, LegacyFIDScorer, sliced_wasserstein
 
 COLUMNS = [
-    "tag", "device", "init", "ae_split", "solver", "n_landmarks",
+    "tag", "device", "init", "ae_split", "solver", "dr_fit", "lambda_rule", "n_landmarks",
     "data_seed", "repeat", "pipeline_seed", "target_a",
     "n_obs", "w_conf", "tau", "alpha", "k_mask",
     "n_ae", "n_causal", "n_arm_causal", "n_dr", "n_folds",
@@ -80,6 +87,9 @@ COLUMNS = [
     "colour_mean_flow", "colour_std_flow", "colour_w2_flow", "sw1_flow", "sw2_flow", "mmd2_flow",
     "colour_mean_floor", "colour_std_floor", "colour_w2_floor",
     "sw1_floor", "sw2_floor", "mmd2_floor",
+    "colour_mean_floor_matched", "colour_std_floor_matched", "colour_w2_floor_matched",
+    "sw1_floor_matched", "sw2_floor_matched", "mmd2_floor_matched",
+    "latent_sw2_floor_matched", "n_floor_matched", "n_floor_matched_latent",
     "colour_mean_roundtrip", "colour_std_roundtrip", "colour_w2_roundtrip",
     "sw1_roundtrip", "sw2_roundtrip", "mmd2_roundtrip",
     "colour_mean_oracle", "colour_std_oracle",
@@ -181,8 +191,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w_conf", type=float, default=10.0,
                         help="confounding strength w in e(1|x) = sigmoid(w (x - 1/2))")
     parser.add_argument("--tau", type=float, default=0.08, help="foreground mask threshold")
-    parser.add_argument("--alpha", type=float, default=0.0, help="fixed green channel")
-    parser.add_argument("--k_mask", type=float, default=10.0, help="foreground mask sharpness")
+    parser.add_argument("--alpha", type=float, default=0.2, help="fixed green channel")
+    parser.add_argument("--k_mask", type=float, default=20.0, help="foreground mask sharpness")
     parser.add_argument("--data_seeds", type=int, nargs="+", default=[0],
                         help="DGP seeds run by this task")
     parser.add_argument("--n_repeats", type=int, default=3,
@@ -226,8 +236,8 @@ def parse_args() -> argparse.Namespace:
                              "logged sample (the reference design); 'none' trains it on "
                              "every row and lets the causal stage reuse them, trading the "
                              "feature map's independence for twice the eligible data.")
-    parser.add_argument("--solver", type=str, default="nystrom",
-                        choices=("auto", "exact", "nystrom"),
+    parser.add_argument("--solver", type=str, default="projected_nystrom",
+                        choices=("auto", "exact", "nystrom", "projected_nystrom"),
                         help="how each fold's CME ridge system is solved. 'auto' (default) "
                              "solves exactly while that stays affordable and switches to "
                              "Nystrom above --exact_max_n_obs. The DR support is EVERY "
@@ -242,6 +252,29 @@ def parse_args() -> argparse.Namespace:
                              "fold would be a (4/5 n_obs)^2 float64 system")
     parser.add_argument("--n_landmarks", type=int, default=1024,
                         help="Nystrom landmarks per fold")
+    parser.add_argument("--dr_fit", type=str, default="nosplit",
+                        choices=("crossfit", "nosplit"),
+                        help="how the DR nuisances are fitted. DEFAULT CHANGED 2026-09-28 to 'nosplit', which fits the CME and the propensity on ALL rows; 'crossfit' (the previous default) fits both out of fold. The same-sample notes license reusing observations for the NUISANCES. NOTE the filename token is deliberately still keyed on 'crossfit': a 'nosplit' run appends _drnosplit and a 'crossfit' run appends nothing, exactly as before the default flipped, so every historical filename is still reproduced byte for byte and no new run can overwrite an archived one. The dr_fit CSV column is the authoritative record. "
+                             "historical behaviour) fits the CME and the propensity out of "
+                             "fold; 'nosplit' fits both on ALL rows. NOTE this is a DIFFERENT "
+                             "axis from --ae_split, which controls whether the autoencoder "
+                             "sees the causal rows. The same-sample notes license reusing "
+                             "observations for NUISANCES but explicitly not for an encoder "
+                             "selected on those rows, so --ae_split half --dr_fit nosplit is "
+                             "the combination their theory covers.")
+    parser.add_argument("--lambda_rule", type=str, default="cv",
+                        choices=("cv", "n_half"),
+                        help="ridge selection. 'cv' (default, historical) cross-validates per "
+                             "training block; 'n_half' uses lambda = c * n^-1/2, the rate the "
+                             "same-sample theory gives as sufficient, and keeps the penalty "
+                             "matched between --dr_fit arms.")
+    parser.add_argument("--lambda_constant", type=float, default=1.0,
+                        help="the constant c in --lambda_rule n_half")
+    parser.add_argument("--snapshot_every", type=int, default=None,
+                        help="store the particle cloud every this many iterations so one run "
+                             "yields a whole iteration curve. This sampler uses a FIXED Euler "
+                             "step, so a snapshot at step s is exactly a run of s steps -- "
+                             "unlike the cosine-scheduled Riesz simulations.")
     parser.add_argument("--n_folds", type=int, default=5)
     parser.add_argument("--latent_dim", type=int, default=32)
     parser.add_argument("--ae_iterations", type=int, default=3000)
@@ -261,6 +294,24 @@ def csv_path(args: argparse.Namespace) -> Path:
     arms = "".join(str(arm) for arm in args.target_arms)
     suffix = "" if args.init == "observed" else f"_init{args.init}"
     suffix += "_nosplit" if args.ae_split == "none" else ""
+    # Tokens appended only off-default so historical filenames are reproduced exactly.
+    # `_dr*` is deliberately distinct from the `_nosplit` token just above: --ae_split
+    # and --dr_fit are different ablations and their filenames must not collide.
+    if args.dr_fit != "crossfit":
+        suffix += f"_dr{args.dr_fit}"
+    if args.lambda_rule != "cv":
+        suffix += f"_lam{args.lambda_rule}"
+    # One token per explicitly requested solver, so an --solver sweep cannot have two
+    # cells write the same filename. Keyed on args.solver (not the RESOLVED solver), so
+    # historical runs that passed --solver auto keep their exact filenames.
+    if args.solver == "projected_nystrom":
+        suffix += "_projnys"
+    elif args.solver == "exact":
+        suffix += "_exact"
+    elif args.solver == "nystrom":
+        suffix += "_nys"
+    if args.flow_iterations != 3000:
+        suffix += f"_it{args.flow_iterations}"
     name = (f"colormnist_{args.tag}_nobs{args.n_obs}_M{args.n_particles}"
             f"_w{args.w_conf:g}_a{args.alpha:g}_k{args.k_mask:g}_tau{args.tau:g}"
             f"_arms{arms}_ds{seeds}{suffix}.csv")
@@ -288,29 +339,107 @@ def evaluate_images(images_01: torch.Tensor, reference_01: torch.Tensor,
     }
 
 
+def subsample_rows(sample: torch.Tensor, k: int,
+                   generator: "torch.Generator") -> torch.Tensor:
+    """A random k-row subset of `sample`, or the whole sample when it has at most k rows.
+
+    Parameters
+    ----------
+    sample : torch.Tensor of shape (n, ...)
+    k : int
+        Target row count.
+    generator : torch.Generator
+        CPU generator; the permutation is drawn on the CPU so the subset does not
+        depend on the device.
+
+    Returns
+    -------
+    torch.Tensor of shape (min(n, k), ...)
+    """
+    if sample.shape[0] <= k:
+        return sample
+    pick = torch.randperm(sample.shape[0], generator=generator)[:k]
+    return sample[pick.to(sample.device)]
+
+
+def matched_floor(images_01: torch.Tensor, reference_01: torch.Tensor,
+                  kernel_pixel: RBF, k: int, seed: int) -> dict:
+    """The oracle-vs-oracle floor recomputed at the count this row's flow was scored at.
+
+    Sliced Wasserstein, the colour-ratio W2 and the unbiased MMD^2 are all SAMPLE-SIZE
+    BIASED: two independent draws of the SAME law score further apart at small counts
+    than at large ones. `sliced_wasserstein` truncates to the smaller of its two inputs,
+    so a flow row is effectively scored at k = min(n_scored, n_ref) while the plain
+    floor is scored at the full n_ref. Sweeping the particle count then moves the flow
+    rows while the floor stays put, which reads as a spurious "more particles is
+    better". Subsampling BOTH floor inputs to the same k removes that gap; the subsets
+    come from a fixed seed derived from the pipeline seed, so the columns are
+    reproducible.
+
+    Parameters
+    ----------
+    images_01, reference_01 : torch.Tensor of shape (n, 3, 28, 28)
+        The two independent oracle draws, in [0, 1].
+    kernel_pixel : RBF
+        Pixel kernel with its bandwidth already locked on the reference draw.
+    k : int
+        Effective count at which this row's flow sample was scored.
+    seed : int
+        Seed of the CPU generator drawing both subsets.
+
+    Returns
+    -------
+    dict
+        The keys of `evaluate_images`, to be suffixed by the caller.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    return evaluate_images(subsample_rows(images_01, k, generator),
+                           subsample_rows(reference_01, k, generator), kernel_pixel)
+
+
 def run_arm(target_a: int, ae, pools: list, data: torch.Tensor,
             causal_idx: torch.Tensor, A_obs: torch.Tensor, A_s: torch.Tensor,
             Z_s: torch.Tensor, e1: torch.Tensor, K_x, K_a, gram, gram_x, solver: str,
             fold_ids: np.ndarray, fold_lambdas: dict, args: argparse.Namespace,
-            seed: int, device: torch.device, fid_scorers: dict = None) -> dict:
+            seed: int, device: torch.device, fid_scorers: dict = None,
+            nosplit_lambda: float = None) -> dict:
     """Arm-specific half of one repeat: DR weights, flow, and oracle evaluation."""
     n_dr = len(A_s)
     e_target = e1 if target_a == 1 else 1.0 - e1
     w_hat = (A_s.cpu() == target_a).double() / e_target
     on_arm = w_hat[A_s.cpu() == target_a]
     ess = float(on_arm.sum() ** 2 / (on_arm ** 2).sum())
-    if solver == "nystrom":
+    if solver in ("nystrom", "projected_nystrom"):
         # K_pi[i, j] = K_X[i, j] * 1{a_i == a}: the target action is deterministic
         on_arm_flag = (A_s.cpu() == target_a).double()
         gram_pi = lambda rows, cols: gram_x(rows, cols) * on_arm_flag[rows][:, None]
-        v_dr = cpme_dr_weights_crossfit_nystrom(
-            gram, gram_pi, w_hat, fold_ids, fold_lambdas,
-            n_landmarks=args.n_landmarks,
-            generator=torch.Generator().manual_seed(seed)).float().to(device)
+        # `projected_nystrom` restricts the CME ridge regression to the landmark-spanned
+        # subspace and builds the DR right-hand side only at the landmarks. That is the
+        # estimator the imported consistency rate is stated for, and it touches an
+        # m x |H| cross-kernel instead of a |T| x |H| one. `nystrom` applies an
+        # approximate Gram inverse to the exact full right-hand side -- a different
+        # estimator, kept as the baseline that produced every earlier table.
+        projected = solver == "projected_nystrom"
+        if args.dr_fit == "nosplit":
+            solve = (cpme_dr_weights_projected_nystrom if projected
+                     else cpme_dr_weights_nystrom)
+            v_dr = solve(gram, gram_pi, w_hat, nosplit_lambda,
+                         n_landmarks=args.n_landmarks,
+                         generator=torch.Generator().manual_seed(seed)).float().to(device)
+        else:
+            solve = (cpme_dr_weights_crossfit_projected_nystrom if projected
+                     else cpme_dr_weights_crossfit_nystrom)
+            v_dr = solve(gram, gram_pi, w_hat, fold_ids, fold_lambdas,
+                         n_landmarks=args.n_landmarks,
+                         generator=torch.Generator().manual_seed(seed)).float().to(device)
     else:
         K_a_target = (A_s == target_a).double().cpu()[:, None].expand(n_dr, n_dr).contiguous()
-        v_dr = cpme_dr_weights_crossfit(K_x, K_a, K_a_target, w_hat, fold_ids,
-                                        fold_lambdas).float().to(device)
+        if args.dr_fit == "nosplit":
+            v_dr = cpme_dr_weights(K_x, K_a, K_a_target, w_hat,
+                                   nosplit_lambda).float().to(device)
+        else:
+            v_dr = cpme_dr_weights_crossfit(K_x, K_a, K_a_target, w_hat, fold_ids,
+                                            fold_lambdas).float().to(device)
 
     t0 = time.time()
     arm_causal = causal_idx[A_obs[causal_idx] == target_a]
@@ -336,7 +465,9 @@ def run_arm(target_a: int, ae, pools: list, data: torch.Tensor,
                                            initial_particles=initial_particles,
                                            step_size=step_size,
                                            n_iterations=args.flow_iterations,
-                                           target_weights=v_dr, log_every=500, verbose=False)
+                                           target_weights=v_dr,
+                                           snapshot_every=args.snapshot_every,
+                                           log_every=500, verbose=False)
     seconds_flow = time.time() - t0
 
     eval_idx = torch.arange(n_particles, device=particles.device)
@@ -373,6 +504,16 @@ def run_arm(target_a: int, ae, pools: list, data: torch.Tensor,
         "flow": sliced_wasserstein(particles, Z_oracle, p=2, seed=0).item(),
         "floor": sliced_wasserstein(Z_oracle_2, Z_oracle, p=2, seed=0).item(),
     }
+    # Count-matched floors (see `matched_floor`). The latent metrics score EVERY
+    # particle while the pixel metrics score the --eval_particles subset, so the two
+    # effective counts differ whenever M exceeds --eval_particles and each floor takes
+    # its own k.
+    k_pixel = min(len(eval_idx), len(Y_oracle))
+    k_latent = min(n_particles, len(Z_oracle))
+    latent_generator = torch.Generator().manual_seed(seed + 13)
+    latent_sw2["floor_matched"] = sliced_wasserstein(
+        subsample_rows(Z_oracle_2, k_latent, latent_generator),
+        subsample_rows(Z_oracle, k_latent, latent_generator), p=2, seed=0).item()
 
     ratio_oracle = color_ratio(Y_oracle)
     row = {
@@ -388,6 +529,8 @@ def run_arm(target_a: int, ae, pools: list, data: torch.Tensor,
         "latent_sw2_initial": latent_sw2["initial"],
         "latent_sw2_flow": latent_sw2["flow"],
         "latent_sw2_floor": latent_sw2["floor"],
+        "latent_sw2_floor_matched": latent_sw2["floor_matched"],
+        "n_floor_matched": int(k_pixel), "n_floor_matched_latent": int(k_latent),
         "colour_mean_oracle": float(ratio_oracle.mean()),
         "colour_std_oracle": float(ratio_oracle.std()),
         "seconds_flow": round(seconds_flow, 1),
@@ -396,6 +539,8 @@ def run_arm(target_a: int, ae, pools: list, data: torch.Tensor,
                          ("floor", Y_oracle_2), ("roundtrip", decoded_oracle)):
         metrics = evaluate_images(images, Y_oracle, kernel_pixel)
         row.update({f"{key}_{name}": value for key, value in metrics.items()})
+    matched = matched_floor(Y_oracle_2, Y_oracle, kernel_pixel, k_pixel, seed + 12)
+    row.update({f"{key}_floor_matched": value for key, value in matched.items()})
     t0 = time.time()
     for impl, scorer in (fid_scorers or {}).items():
         oracle_features = scorer.features(Y_oracle, image_range="zero_one")
@@ -459,7 +604,15 @@ def run_repeat(pools: list, data: torch.Tensor, X_obs: torch.Tensor, A_obs: torc
 
     fold_ids = make_crossfit_fold_ids(n_dr, n_folds=args.n_folds, seed=0)
     torch.manual_seed(seed)
-    e1 = crossfit_propensity(X_s.unsqueeze(1).double().cpu(), A_s.double().cpu(), fold_ids)
+    if args.dr_fit == "nosplit":
+        # Fit once on all rows and predict on them. NOT crossfit_propensity with one
+        # fold: that silently returns a constant 0.5, which would leave the two arms
+        # differing only in the CME nuisance.
+        model = LogisticPropensityModel()
+        model.fit(X_s.unsqueeze(1).double().cpu(), A_s.double().cpu())
+        e1 = model.predict(X_s.unsqueeze(1).double().cpu()).reshape(-1).double()
+    else:
+        e1 = crossfit_propensity(X_s.unsqueeze(1).double().cpu(), A_s.double().cpu(), fold_ids)
 
     # The RBF lengthscale is locked once on a bounded subsample; the median over the
     # full n_dr^2 pairs is both unaffordable and unnecessary at n_dr = 20000.
@@ -478,13 +631,22 @@ def run_repeat(pools: list, data: torch.Tensor, X_obs: torch.Tensor, A_obs: torc
         return gram_x(rows, cols) * (A_cpu[rows][:, None] == A_cpu[cols][None, :]).double()
 
     # lambda does not need the full training block, which would itself be an n^3 solve
-    fold_lambdas = {}
-    for fold in np.unique(fold_ids):
-        train = np.where(fold_ids != fold)[0]
-        pick = train[torch.randperm(len(train),
-                                    generator=torch.Generator().manual_seed(0))[:2000].numpy()]
-        fold_lambdas[int(fold)], _ = select_regularization(gram(pick, pick),
-                                                           Z_s[pick, 0].double().cpu(), seed=0)
+    if args.lambda_rule == "n_half":
+        nosplit_lambda = lambda_n_half(n_dr, args.lambda_constant)
+        fold_lambdas = {int(f): nosplit_lambda for f in np.unique(fold_ids)}
+    else:
+        fold_lambdas = {}
+        for fold in np.unique(fold_ids):
+            train = np.where(fold_ids != fold)[0]
+            pick = train[torch.randperm(len(train),
+                                        generator=torch.Generator().manual_seed(0))[:2000].numpy()]
+            fold_lambdas[int(fold)], _ = select_regularization(gram(pick, pick),
+                                                               Z_s[pick, 0].double().cpu(), seed=0)
+        nosplit_lambda = None
+        if args.dr_fit == "nosplit":
+            pick = torch.randperm(n_dr, generator=torch.Generator().manual_seed(0))[:2000].numpy()
+            nosplit_lambda, _ = select_regularization(gram(pick, pick),
+                                                      Z_s[pick, 0].double().cpu(), seed=0)
     K_x = kernel_x(X_cpu) if solver == "exact" else None
     K_a = (A_cpu[:, None] == A_cpu[None, :]).double() if solver == "exact" else None
     seconds_nuisance = time.time() - t0
@@ -493,8 +655,9 @@ def run_repeat(pools: list, data: torch.Tensor, X_obs: torch.Tensor, A_obs: torc
     shared = {
         "tag": args.tag, "device": str(device), "init": args.init,
         "ae_split": args.ae_split,
-        "solver": solver,
-        "n_landmarks": args.n_landmarks if solver == "nystrom" else 0,
+        "solver": solver, "dr_fit": args.dr_fit, "lambda_rule": args.lambda_rule,
+        "n_landmarks": (args.n_landmarks
+                        if solver in ("nystrom", "projected_nystrom") else 0),
         "data_seed": data_seed, "repeat": repeat, "pipeline_seed": seed,
         "n_obs": args.n_obs, "w_conf": args.w_conf,
         "tau": args.tau, "alpha": args.alpha, "k_mask": args.k_mask,
@@ -510,7 +673,8 @@ def run_repeat(pools: list, data: torch.Tensor, X_obs: torch.Tensor, A_obs: torc
         row = dict(shared)
         row.update(run_arm(target_a, ae, pools, data, causal_idx, A_obs, A_s, Z_s,
                            e1, K_x, K_a, gram, gram_x, solver, fold_ids,
-                           fold_lambdas, args, seed, device, fid_scorers))
+                           fold_lambdas, args, seed, device, fid_scorers,
+                           nosplit_lambda))
         rows.append(row)
     seconds_repeat = round(time.time() - t_start, 1)
     for row in rows:

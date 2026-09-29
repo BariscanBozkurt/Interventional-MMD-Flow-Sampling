@@ -25,7 +25,10 @@ logged row (--n_dr caps it only on request) solved with the Nystrom solver at ev
 --n_ref 2000 counterfactual reference draw (seed 100000 + data_seed, independent of
 n_obs), with the floor a second independent 2000-draw against the first, so every
 row is a 2000-vs-2000 number regardless of n_obs. The outcome kernel median stays
-locked on the FULL logged sample, as in the notebooks.
+locked on the FULL logged sample, as in the notebooks. The *_floor_matched columns
+repeat that floor with both oracle draws cut to n_floor_matched = min(m, n_ref), the
+count the row's own particles were scored at, because these metrics shrink with the
+sample size they are evaluated at; compare a swept --n_particles against those.
 
 Seed scheme: `data_seed` fixes the draw; `pipeline_seed = 1000 * data_seed + repeat`
 fixes the propensity fit, the DR subsample, the particle picks and the Riesz flow.
@@ -50,17 +53,20 @@ sys.path.append(str(REPO_ROOT / "src"))
 
 from kernel_utils import RBF
 from data_utils import sample_decfm_2d_data
-from causality_utils import (cpme_dr_weights_crossfit,
+from causality_utils import (cpme_dr_weights, cpme_dr_weights_crossfit,
                              cpme_dr_weights_crossfit_nystrom,
-                             make_crossfit_fold_ids, select_regularization)
+                             cpme_dr_weights_crossfit_projected_nystrom,
+                             cpme_dr_weights_projected_nystrom, cpme_dr_weights_nystrom,
+                             lambda_n_half, make_crossfit_fold_ids, select_regularization)
 from dens_ratio_utils import LogisticPropensityModel, crossfit_propensity
 from mmd_flow_utils import adamw_riesz_flow, mmd_gradient_flow, squared_mmd
 from metric_utils import sliced_wasserstein
 
 COLUMNS = [
-    "tag", "init", "solver", "n_landmarks",
+    "tag", "init", "solver", "n_landmarks", "dr_fit", "lambda_rule",
     "data_seed", "repeat", "pipeline_seed", "sampler", "target_a",
-    "n_obs", "n_dr", "n_ref", "n_arm", "n_particles_requested", "n_particles", "n_floor",
+    "n_obs", "n_dr", "n_ref", "n_arm", "n_particles_requested", "n_particles",
+    "n_floor", "n_floor_matched",
     "confounding_strength", "mixture_delta", "noise_std", "n_folds",
     "ess_on_arm", "n_on_arm", "sum_v", "sum_abs_v", "fold_lambdas",
     "lengthscale_x", "lengthscale_y",
@@ -68,6 +74,7 @@ COLUMNS = [
     "sw1_initial", "sw2_initial", "mmd2_initial",
     "sw1_flow", "sw2_flow", "mmd2_flow",
     "sw1_floor", "sw2_floor", "mmd2_floor",
+    "sw1_floor_matched", "sw2_floor_matched", "mmd2_floor_matched",
     "seconds_nuisance", "seconds_flow", "seconds_repeat",
 ]
 
@@ -112,6 +119,26 @@ def gaussian_init(reference, n_particles: int, mode: str,
                           device=reference.device, dtype=reference.dtype)
     return mean + weights @ (reference - mean) / (n - 1) ** 0.5
 
+def subsample_rows(sample, n_rows: int, generator) -> "torch.Tensor":
+    """A uniform random `n_rows`-row subsample, or `sample` itself when it is smaller.
+
+    Parameters
+    ----------
+    sample : torch.Tensor of shape (n, d)
+    n_rows : int
+        Target row count.
+    generator : torch.Generator
+        Seeded source of the permutation, so the subsample is reproducible.
+
+    Returns
+    -------
+    torch.Tensor of shape (min(n, n_rows), d)
+    """
+    if len(sample) <= n_rows:
+        return sample
+    return sample[torch.randperm(len(sample), generator=generator)[:n_rows]]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     parser.add_argument("--n_obs", type=int, default=4000,
@@ -121,8 +148,8 @@ def parse_args() -> argparse.Namespace:
                              "every metric (and of the second draw used for the floor)")
     parser.add_argument("--n_particles", type=int, default=2000,
                         help="flow particles m per arm (capped at the arm size)")
-    parser.add_argument("--solver", type=str, default="nystrom",
-                        choices=("auto", "exact", "nystrom"),
+    parser.add_argument("--solver", type=str, default="projected_nystrom",
+                        choices=("auto", "exact", "nystrom", "projected_nystrom"),
                         help="how each fold's CME ridge system is solved. 'auto' (default) "
                              "solves exactly while affordable and switches to Nystrom above "
                              "--exact_max_n_obs. The DR support is EVERY logged row either "
@@ -171,9 +198,35 @@ def parse_args() -> argparse.Namespace:
                              "metric columns describe the run's actual starting cloud, so "
                              "under a Gaussian init they are not the observed-arm baseline "
                              "-- take that from the matching --init observed run.")
+    parser.add_argument("--dr_fit", type=str, default="nosplit",
+                        choices=("crossfit", "nosplit"),
+                        help="how the DR nuisances are fitted. DEFAULT CHANGED 2026-09-28 to 'nosplit', which fits the CME and the propensity on ALL rows; 'crossfit' (the previous default) fits both out of fold. The same-sample notes license reusing observations for the NUISANCES. NOTE the filename token is deliberately still keyed on 'crossfit': a 'nosplit' run appends _drnosplit and a 'crossfit' run appends nothing, exactly as before the default flipped, so every historical filename is still reproduced byte for byte and no new run can overwrite an archived one. The dr_fit CSV column is the authoritative record. "
+                             "historical behaviour) fits the CME and the propensity out of "
+                             "fold. 'nosplit' fits both on ALL rows and evaluates each row's "
+                             "residual with a fit that saw it. The same-sample notes license "
+                             "the latter for a FIXED kernel and feature map under bounded "
+                             "nuisance norms and prediction consistency; it is NOT licensed "
+                             "when the kernel or encoder is itself selected on these rows.")
+    parser.add_argument("--lambda_rule", type=str, default="cv",
+                        choices=("cv", "n_half"),
+                        help="ridge selection. 'cv' (default, historical) cross-validates "
+                             "over a grid per training block. 'n_half' uses the rate the "
+                             "same-sample theory gives as sufficient, lambda = c * n^-1/2, "
+                             "which also keeps the penalty MATCHED between --dr_fit arms: "
+                             "cross-validated lambdas are chosen per block and so differ "
+                             "systematically between a full-sample and a k-fold fit, which "
+                             "would confound that comparison.")
+    parser.add_argument("--lambda_constant", type=float, default=1.0,
+                        help="the constant c in --lambda_rule n_half (the rate is fixed by "
+                             "theory, the constant is not)")
     parser.add_argument("--n_folds", type=int, default=5)
     parser.add_argument("--step_factor", type=float, default=0.05,
                         help="Euler step = step_factor * (outcome lengthscale)^2")
+    parser.add_argument("--flow_iterations", type=int, default=None,
+                        help="sets BOTH --euler_iterations and --riesz_iterations, so a "
+                             "sweep over sampling steps can drive one flag name here as it "
+                             "does in the image simulations. Default None keeps the two "
+                             "separate values below.")
     parser.add_argument("--euler_iterations", type=int, default=3000)
     parser.add_argument("--riesz_iterations", type=int, default=4000)
     parser.add_argument("--learning_rate", type=float, default=5e-4,
@@ -186,7 +239,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tag", type=str, default="twins")
     parser.add_argument("--out_dir", type=str,
                         default=str(Path(__file__).resolve().parent / "results"))
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.flow_iterations is not None:
+        args.euler_iterations = args.riesz_iterations = args.flow_iterations
+    return args
 
 
 
@@ -215,6 +271,25 @@ def csv_path(args: argparse.Namespace) -> Path:
     """One CSV per task, its name carrying the swept constants and the seed block."""
     seeds = "-".join(str(seed) for seed in args.data_seeds)
     suffix = "" if args.init == "observed" else f"_init{args.init}"
+    # Tokens are appended only when the option is off its default, so every filename a
+    # previous run produced is reproduced byte for byte. Without the iteration token a
+    # sweep over step counts silently overwrites itself: write_rows rewrites the whole
+    # file atomically, so the last task to finish would win.
+    if args.dr_fit != "crossfit":
+        suffix += f"_dr{args.dr_fit}"
+    if args.lambda_rule != "cv":
+        suffix += f"_lam{args.lambda_rule}"
+    # One token per explicitly requested solver, so an --solver sweep cannot have two
+    # cells write the same filename. Keyed on args.solver (not the RESOLVED solver), so
+    # historical runs that passed --solver auto keep their exact filenames.
+    if args.solver == "projected_nystrom":
+        suffix += "_projnys"
+    elif args.solver == "exact":
+        suffix += "_exact"
+    elif args.solver == "nystrom":
+        suffix += "_nys"
+    if (args.euler_iterations, args.riesz_iterations) != (3000, 4000):
+        suffix += f"_it{args.euler_iterations}-{args.riesz_iterations}"
     name = (f"decfm2d_{args.tag}_nobs{args.n_obs}_M{args.n_particles}"
             f"_gamma{args.confounding_strength:g}_delta{args.mixture_delta:g}"
             f"_sig{args.noise_std:g}_ds{seeds}{suffix}.csv")
@@ -247,8 +322,16 @@ def run_repeat(data: dict, args: argparse.Namespace, data_seed: int, repeat: int
     n_dr = len(pick_dr)
 
     fold_ids = make_crossfit_fold_ids(n_dr, n_folds=args.n_folds, seed=0)
-    propensity = crossfit_propensity(X_s, A_s_flat, fold_ids,
-                                     model_factory=LogisticPropensityModel)
+    if args.dr_fit == "nosplit":
+        # Fit once on every row and predict on those same rows. NOT crossfit_propensity
+        # with a single fold: that has no guard and silently returns a constant 0.5,
+        # which would leave the two --dr_fit arms differing only in the CME nuisance.
+        model = LogisticPropensityModel()
+        model.fit(X_s, A_s_flat)
+        propensity = model.predict(X_s).reshape(-1).double()
+    else:
+        propensity = crossfit_propensity(X_s, A_s_flat, fold_ids,
+                                         model_factory=LogisticPropensityModel)
 
     kernel_x = RBF(use_length_scale_heuristic=True)
     kernel_a = RBF(length_scale=0.5)
@@ -270,19 +353,32 @@ def run_repeat(data: dict, args: argparse.Namespace, data_seed: int, repeat: int
     K_x = kernel_x(X_s) if solver == "exact" else None
     K_a = kernel_a(A_s) if solver == "exact" else None
 
-    fold_lambdas = {}
-    for fold in np.unique(fold_ids):
-        train = np.where(fold_ids != fold)[0]
-        # lambda does not need the full training block, which is itself an n^3 solve
-        pick = train[torch.randperm(len(train),
-                                    generator=torch.Generator().manual_seed(0))[:2000].numpy()]
-        fold_lambdas[int(fold)], _ = select_regularization(gram(pick, pick),
-                                                           Y_s[pick, 0], seed=0)
+    if args.lambda_rule == "n_half":
+        # one value, matched across arms by construction
+        nosplit_lambda = lambda_n_half(n_dr, args.lambda_constant)
+        fold_lambdas = {int(f): nosplit_lambda for f in np.unique(fold_ids)}
+    else:
+        fold_lambdas = {}
+        for fold in np.unique(fold_ids):
+            train = np.where(fold_ids != fold)[0]
+            # lambda does not need the full training block, which is itself an n^3 solve
+            pick = train[torch.randperm(len(train),
+                                        generator=torch.Generator().manual_seed(0))[:2000].numpy()]
+            fold_lambdas[int(fold)], _ = select_regularization(gram(pick, pick),
+                                                               Y_s[pick, 0], seed=0)
+        # the no-split fit has one training block (all rows), so it needs one scalar;
+        # only selected when that arm is actually requested
+        nosplit_lambda = None
+        if args.dr_fit == "nosplit":
+            pick = torch.randperm(n_dr, generator=torch.Generator().manual_seed(0))[:2000].numpy()
+            nosplit_lambda, _ = select_regularization(gram(pick, pick), Y_s[pick, 0], seed=0)
     seconds_nuisance = time.time() - t0
 
     base = {
         "tag": args.tag, "init": args.init, "solver": solver,
-        "n_landmarks": args.n_landmarks if solver == "nystrom" else 0,
+        "dr_fit": args.dr_fit, "lambda_rule": args.lambda_rule,
+        "n_landmarks": (args.n_landmarks
+                        if solver in ("nystrom", "projected_nystrom") else 0),
         "data_seed": data_seed, "repeat": repeat, "pipeline_seed": seed,
         "n_obs": args.n_obs, "n_dr": int(n_dr), "n_ref": int(len(Y_oracle)),
         "n_particles_requested": args.n_particles,
@@ -295,35 +391,82 @@ def run_repeat(data: dict, args: argparse.Namespace, data_seed: int, repeat: int
         "seconds_nuisance": round(seconds_nuisance, 1),
     }
 
-    def evaluate(cloud):
+    def evaluate(cloud, reference=None):
+        reference = Y_oracle if reference is None else reference
         return {
-            "sw1": sliced_wasserstein(cloud, Y_oracle, p=1, seed=0).item(),
-            "sw2": sliced_wasserstein(cloud, Y_oracle, p=2, seed=0).item(),
-            "mmd2": squared_mmd(kernel_y, cloud, Y_oracle, unbiased=True).item(),
+            "sw1": sliced_wasserstein(cloud, reference, p=1, seed=0).item(),
+            "sw2": sliced_wasserstein(cloud, reference, p=2, seed=0).item(),
+            "mmd2": squared_mmd(kernel_y, cloud, reference, unbiased=True).item(),
         }
 
     n_floor = len(Y_oracle_2)
     floor = evaluate(Y_oracle_2)      # second independent reference draw vs the first
+
+    matched_floors: dict = {}
+
+    def matched_floor(n_matched: int) -> dict:
+        """The oracle-vs-oracle floor recomputed with BOTH draws cut to `n_matched` rows.
+
+        WHY this exists: every cheap distributional metric here is sample-size biased --
+        two independent draws of the SAME law score SW2 ~ 0.0266 at 250 points but
+        ~ 0.0070 at 4000. `sliced_wasserstein` truncates to the smaller sample, so a row
+        with m particles is scored at n_matched = min(m, n_ref) points while `floor` is
+        scored at the full n_ref. Sweeping --n_particles would then move the flow rows
+        and leave the floor put, a purely statistical "more particles is better". This
+        twin puts the floor at the row's own effective count. The subsample is seeded
+        off the pipeline seed, so it is reproducible, and cached because both samplers
+        on an arm share it.
+
+        Parameters
+        ----------
+        n_matched : int
+            Effective count at which this row's particles were scored.
+
+        Returns
+        -------
+        dict
+            The same metric keys as `evaluate`.
+        """
+        if n_matched not in matched_floors:
+            ref = subsample_rows(Y_oracle, n_matched,
+                                 torch.Generator().manual_seed(seed + 7))
+            ref_2 = subsample_rows(Y_oracle_2, n_matched,
+                                   torch.Generator().manual_seed(seed + 8))
+            matched_floors[n_matched] = evaluate(ref_2, ref)
+        return matched_floors[n_matched]
 
     rows = []
     for target_a in (0, 1):
         e_a = propensity if target_a == 1 else 1.0 - propensity
         w_hat = (A_s_flat == target_a).double() / e_a
         on_arm = w_hat[A_s_flat == target_a]
-        if solver == "nystrom":
+        if solver in ("nystrom", "projected_nystrom"):
             # K_A_pi[i, j] = k_A(a_i, a) is the same for every column j, so K_pi's
             # blocks are K_X blocks scaled row-wise.
             target_column = kernel_a(A_s, torch.full((1, 1), float(target_a))).reshape(-1)
             gram_pi = lambda rows, cols: (gram_x(rows, cols)
                                           * target_column[rows][:, None])
-            v_dr = cpme_dr_weights_crossfit_nystrom(
-                gram, gram_pi, w_hat, fold_ids, fold_lambdas,
-                n_landmarks=args.n_landmarks,
-                generator=torch.Generator().manual_seed(seed))
+            if args.dr_fit == "nosplit":
+                solve = (cpme_dr_weights_projected_nystrom
+                         if solver == "projected_nystrom" else cpme_dr_weights_nystrom)
+                v_dr = solve(
+                    gram, gram_pi, w_hat, nosplit_lambda,
+                    n_landmarks=args.n_landmarks,
+                    generator=torch.Generator().manual_seed(seed))
+            else:
+                solve = (cpme_dr_weights_crossfit_projected_nystrom
+                         if solver == "projected_nystrom" else cpme_dr_weights_crossfit_nystrom)
+                v_dr = solve(
+                    gram, gram_pi, w_hat, fold_ids, fold_lambdas,
+                    n_landmarks=args.n_landmarks,
+                    generator=torch.Generator().manual_seed(seed))
         else:
             K_a_target = kernel_a(A_s, torch.full((n_dr, 1), float(target_a)))
-            v_dr = cpme_dr_weights_crossfit(K_x, K_a, K_a_target, w_hat, fold_ids,
-                                            fold_lambdas)
+            if args.dr_fit == "nosplit":
+                v_dr = cpme_dr_weights(K_x, K_a, K_a_target, w_hat, nosplit_lambda)
+            else:
+                v_dr = cpme_dr_weights_crossfit(K_x, K_a, K_a_target, w_hat, fold_ids,
+                                                fold_lambdas)
 
         arm_idx = torch.nonzero(A_flat == target_a).ravel()
         n_particles = min(args.n_particles, len(arm_idx))
@@ -335,7 +478,16 @@ def run_repeat(data: dict, args: argparse.Namespace, data_seed: int, repeat: int
         else:
             init = gaussian_init(Y_s, n_particles, args.init,
                                  torch.Generator().manual_seed(seed + 3))
-        initial_metrics = evaluate(Y_logged[arm_idx])
+        # Score the cloud the flow ACTUALLY starts from, which is what --init selects and
+        # what the flag's help promises. Until 2026-09-28 this scored the whole logged arm
+        # regardless of --init, so every initialisation reported an identical *_initial row
+        # and an --init sweep recorded nothing about where the Gaussian arms began. Under
+        # --init observed this is now the sampled arm subset rather than the full arm, so it
+        # is also counted consistently with the flow row it is compared against.
+        initial_metrics = evaluate(init)
+        # the count the flowed cloud is actually scored at (sliced_wasserstein truncates)
+        n_matched = min(n_particles, len(Y_oracle))
+        floor_matched = matched_floor(n_matched)
 
         for sampler in args.samplers:
             t0 = time.time()
@@ -360,7 +512,7 @@ def run_repeat(data: dict, args: argparse.Namespace, data_seed: int, repeat: int
             row.update({
                 "sampler": sampler, "target_a": target_a,
                 "n_arm": int(len(arm_idx)), "n_particles": int(n_particles),
-                "n_floor": int(n_floor),
+                "n_floor": int(n_floor), "n_floor_matched": int(n_matched),
                 "ess_on_arm": float(on_arm.sum() ** 2 / (on_arm ** 2).sum()),
                 "n_on_arm": int(len(on_arm)),
                 "sum_v": float(v_dr.sum()), "sum_abs_v": float(v_dr.abs().sum()),
@@ -371,6 +523,8 @@ def run_repeat(data: dict, args: argparse.Namespace, data_seed: int, repeat: int
             row.update({f"{key}_initial": value for key, value in initial_metrics.items()})
             row.update({f"{key}_flow": value for key, value in evaluate(flowed).items()})
             row.update({f"{key}_floor": value for key, value in floor.items()})
+            row.update({f"{key}_floor_matched": value
+                        for key, value in floor_matched.items()})
             rows.append(row)
 
     seconds_repeat = round(time.time() - t_start, 1)

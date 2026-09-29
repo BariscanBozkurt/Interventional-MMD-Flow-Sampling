@@ -10,3 +10,6 @@ from .dsprites_multifactor import (SHAPE_DIRECTIONS, colour_ratio,
                                    multifactor_policies, render_bilinear,
                                    sample_coloured_dsprite_data,
                                    sample_multifactor_dsprite_data)
+from .warfarin import (dosing_outcome, interventional_cdf,
+                       load_warfarin_cohort, sample_warfarin_data,
+                       warfarin_policies)
