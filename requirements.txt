@@ -1,0 +1,18 @@
+# Python 3.12. Install torch/torchvision for the CUDA build available locally.
+torch==2.10.0
+torchvision==0.25.0
+numpy==2.3.5
+scipy==1.17.0
+scikit-learn==1.8.0
+pandas==3.0.0
+matplotlib==3.10.8
+tqdm
+
+# Frozen SD-VAE used by CelebA.
+diffusers==0.39.0
+
+# Optional clean FID implementation used in the reported image experiments.
+clean-fid
+
+# Notebook environment.
+jupyterlab

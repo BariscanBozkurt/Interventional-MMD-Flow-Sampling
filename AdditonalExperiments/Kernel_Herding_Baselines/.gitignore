@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+logs/
+results/
+
+# Site-specific scheduler launchers stay local. Run the Python entry points
+# directly or adapt those commands to your own scheduler.
+submit_*.sh

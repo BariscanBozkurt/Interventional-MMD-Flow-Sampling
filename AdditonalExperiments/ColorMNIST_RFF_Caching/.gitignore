@@ -1,0 +1,10 @@
+# Public source allowlist. Everything else stays local, including generated
+# results, models, notebooks, research notes and machine-specific launch files.
+*
+!.gitignore
+!README.md
+!rff_imq.py
+!reference_field.py
+!run_small_batch_comparison.py
+!test_rff_imq.py
+!test_reference_field.py

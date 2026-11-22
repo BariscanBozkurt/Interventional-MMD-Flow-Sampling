@@ -237,8 +237,48 @@ tests/
 
 # Agent handoff notes (not part of the published code)
 CLAUDE.md
+AGENTS.md
+CODEX.md
+.agents/
+.codex/
+.claude/
 
 # Archived simulation results: superseded runs, kept locally for reference only.
 # The whole folder is ignored, READMEs included.
 Simulations/*/dr_mmd_flow/results_archive_*/
 results_archive_*/
+
+# Public-release safety: numerical outputs may contain host names, scheduler
+# identifiers, absolute paths, or large particle arrays.  Keep them locally and
+# publish the code that regenerates them instead.
+**/results*/
+**/runs/
+**/cache/
+**/logs/
+*.csv
+*.tsv
+*.parquet
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Generated qualitative artifacts can contain dataset-derived images.  The
+# scripts and textual aggregate tables are sufficient for the public tree.
+AdditonalExperiments/**/figures/
+NotebookExamples/**/figures/
+
+# Local paper-figure workbooks are presentation artifacts rather than the
+# reproducible worked examples shipped with the repository.
+NotebookExamples/**/*Paper_Figures.ipynb
+NotebookExamples/**/*Workshop.ipynb
+Simulations/AnalyzeSimulationResults/Warfarin_Results_Analysis.ipynb
+
+# Internal work records are not part of the public implementation.
+**/README.local.md
+**/OVERNIGHT_PLAN.md
+**/analysis_local/
+AdditonalExperiments/ColorMNIST_Nuisance_Misspecification/EXPERIMENT_REPORT.md
+AdditonalExperiments/CelebA_RFF_Caching/
