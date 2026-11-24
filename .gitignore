@@ -265,10 +265,14 @@ results_archive_*/
 *.ckpt
 *.safetensors
 
-# Generated qualitative artifacts can contain dataset-derived images.  The
-# scripts and textual aggregate tables are sufficient for the public tree.
+# Generated qualitative artifacts stay local except the two selected
+# collaborator-facing PDF diagnostics linked from AdditonalExperiments/README.
 AdditonalExperiments/**/figures/
 NotebookExamples/**/figures/
+!AdditonalExperiments/CelebA_Hair_Colour_Diagnostic/figures/
+AdditonalExperiments/CelebA_Hair_Colour_Diagnostic/figures/*
+!AdditonalExperiments/CelebA_Hair_Colour_Diagnostic/figures/celeba_ranked_pixel_change_top128_both_arms.pdf
+!AdditonalExperiments/CelebA_Theory_Sampler_Ablation/figures/
 
 # Local paper-figure workbooks are presentation artifacts rather than the
 # reproducible worked examples shipped with the repository.

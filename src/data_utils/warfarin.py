@@ -7,9 +7,10 @@ the sampler both support a general stochastic `pi`, but nothing demonstrates it.
 This design closes that gap on real covariates, and does so with a target policy
 chosen to make the case for sampling rather than point estimation.
 
-Construction follows Appendix 14.1.4 of Zenati, Bozkurt and Gretton (2025),
-arXiv:2506.02793, on the IWPC warfarin dosing table (PharmGKB; see
-data/warfarin/SOURCE.txt):
+The COHORT, the OUTCOME MODEL and the LOGGING POLICY follow Appendix 14.1.4 of
+Zenati, Bozkurt and Gretton (2025), arXiv:2506.02793, on the IWPC warfarin
+dosing table (PharmGKB; see data/warfarin/SOURCE.txt). The TARGET POLICIES
+deliberately do not; see "Deviation from the appendix" below.
 
     X            standardised patient covariates -- demographics, anthropometry,
                  BMI, the eight clinical indications, comorbidities, concomitant
@@ -20,15 +21,23 @@ data/warfarin/SOURCE.txt):
     A            the administered weekly dose, continuous.
     Y(a, X)      max(|a - TherDose(X)| - tolerance * TherDose(X), 0) + eps,
                  eps ~ N(0, outcome_noise^2): the dosing error outside a
-                 +/- tolerance band, i.e. how badly a patient is mis-dosed.
+                 +/- tolerance band, i.e. how badly a patient is mis-dosed. The
+                 appendix's expert-motivated cost, at its tolerance 0.1 and its
+                 noise N(0, 0.1^2) -- the defaults here.
 
 The logging policy is confounded through body mass,
 
     A | X ~ N(mu_T + sigma_T sqrt(theta) Z_BMI,  sigma_T^2 (1 - theta)),
 
 with mu_T, sigma_T the cohort mean and standard deviation of the therapeutic
-dose. Marginally the logged dose then matches the therapeutic-dose distribution,
-while a fraction `theta` of its variance is explained by BMI -- and BMI is
+dose and theta = 0.5 as in the appendix. Marginally the logged dose matches the
+therapeutic dose in its first two MOMENTS only: the logged action is Gaussian by
+construction while the therapeutic dose is strongly right-skewed (skew 2.65
+against 0.52) and strictly positive, so about 1.6% of logged doses come out
+negative.
+Those are clinically impossible but well defined as inputs to the cost, and they
+are the appendix's design; they are noted here because they feed the mis-dosing
+tail. A fraction `theta` of the logged variance is explained by BMI, and BMI is
 genuinely predictive of the therapeutic dose in this cohort (corr about +0.31),
 so the logged outcomes are confounded.
 
@@ -48,6 +57,32 @@ sampler sees it; a mean estimator does not.
 Because the outcome is scalar and the cost piecewise linear in the action, the
 interventional law is available in CLOSED FORM: `interventional_cdf` evaluates
 it, so a sampler can be scored without a finite oracle draw.
+
+Deviation from the appendix: the target policies
+------------------------------------------------
+The appendix's four scenarios are designed for a two-sample TEST, and compare
+two policies whose means are LINEAR in the covariates: pi = N(X^T w_base,
+sigma_T^2) against a null (Scenario I), an intercept shift by Delta = sigma_T
+(II), a 50/50 mixture at intercepts +/- Delta (III), and a 50/50 mixture at 0
+and +Delta (IV). The three families above are the sampling analogues of II, III
+and IV, with delta_scale = 0 giving the null of I, but they differ from the
+appendix in two respects, both required for a SAMPLING benchmark rather than a
+test:
+
+  * they anchor on the LOGGING policy's exact conditional mean, not on a linear
+    score. The appendix obtains w_base by regressing the logged dose on X and
+    optionally jittering the coefficients, so X^T w_base is an ESTIMATE of that
+    same mean. For a test this is harmless -- both compared policies share the
+    anchor -- but here mean preservation would hold only up to regression error
+    and jitter, and a residual first-moment gap is indistinguishable, in the
+    interventional OUTCOME law, from the higher-moment effect the design exists
+    to exhibit. Anchoring on pi_0 makes E[A | X] provably unchanged.
+  * they use the logging policy's CONDITIONAL scale sigma_T sqrt(1 - theta), and
+    delta = delta_scale * sigma_T * sqrt(1 - theta) in those units. The
+    appendix's sigma_T is the MARGINAL dose spread, larger by 1 / sqrt(1 - theta),
+    so a target at that scale is already wider than pi_0 before any shift is
+    applied. Setting delta_scale = 1 / sqrt(1 - theta) -- sqrt(2) at theta = 0.5
+    -- reproduces the appendix's Delta = sigma_T exactly.
 """
 
 from typing import Optional, Tuple
@@ -80,6 +115,25 @@ INDICATION_COLUMN = "Indication for Warfarin Treatment"
 #: else is numeric or already a 0/1 flag.
 CATEGORICAL_COVARIATES = ("Gender", "Race", "Ethnicity",
                           "CYP2C9 consensus", "VKORC1 -1639 consensus")
+
+#: A categorical cell left blank becomes this level rather than dropping the
+#: patient: "not recorded" is informative here (807 of 3964 patients have no
+#: VKORC1 genotype), and the appendix drops patients on BMI only.
+MISSING_LEVEL = "Unknown"
+
+#: The level each categorical covariate is one-hot encoded AGAINST, i.e. the one
+#: column not kept, so that the survivors are contrasts against a named
+#: baseline. Fixed per covariate rather than taken as the first level in sort
+#: order: MISSING_LEVEL sorts ahead of the recorded levels of Gender, which would
+#: make "sex not recorded" (four patients) the reference class and leave two
+#: near-complementary sex indicators behind. Each entry is the modal level of
+#: that covariate in the cohort, written out so the encoding does not move if the
+#: cohort filters change.
+REFERENCE_LEVELS = {"Gender": "male",
+                    "Race": "White",
+                    "Ethnicity": "not Hispanic or Latino",
+                    "CYP2C9 consensus": "*1/*1",
+                    "VKORC1 -1639 consensus": "A/A"}
 
 #: Comorbidities, smoking, and the single-column medications. A blank cell in
 #: this table means "not recorded as present", so these read as 0 rather than
@@ -164,6 +218,26 @@ def _indication_indicators(frame: pd.DataFrame) -> pd.DataFrame:
         index=frame.index)
 
 
+def _one_hot(frame: pd.DataFrame) -> pd.DataFrame:
+    """
+    The categorical covariates one-hot encoded against REFERENCE_LEVELS.
+
+    One column per observed level of each covariate, MISSING_LEVEL included, less
+    that covariate's reference level. Columns are named by the canonical
+    covariate name, so the encoding does not depend on which alias the file uses.
+    """
+    encoded = []
+    for name in CATEGORICAL_COVARIATES:
+        levels = frame[_resolve(frame, name)].fillna(MISSING_LEVEL)
+        dummies = pd.get_dummies(levels, prefix=name, dtype=float)
+        reference = f"{name}_{REFERENCE_LEVELS[name]}"
+        if reference not in dummies.columns:
+            raise KeyError(f"reference level {reference!r} is absent from this "
+                           f"warfarin file (levels: {sorted(dummies.columns)})")
+        encoded.append(dummies.drop(columns=reference))
+    return pd.concat(encoded, axis=1)
+
+
 def _covariate_frame(frame: pd.DataFrame, bmi: pd.Series) -> pd.DataFrame:
     """The covariate matrix of Appendix 14.1.4, before any column is dropped."""
     numeric = pd.DataFrame({"Age (decade)": _age_decade(frame),
@@ -177,11 +251,8 @@ def _covariate_frame(frame: pd.DataFrame, bmi: pd.Series) -> pd.DataFrame:
                                         axis=0)
                            for name, members in DRUG_GROUPS.items()},
                           index=frame.index)
-    categorical = frame[[_resolve(frame, name) for name in CATEGORICAL_COVARIATES]]
-    dummies = pd.get_dummies(categorical.fillna("Unknown"), drop_first=True,
-                             dtype=float)
     return pd.concat([numeric, _indication_indicators(frame), flags, groups,
-                      dummies], axis=1)
+                      _one_hot(frame)], axis=1)
 
 
 def load_warfarin_cohort(csv_path: str,
@@ -196,7 +267,8 @@ def load_warfarin_cohort(csv_path: str,
     flag set and both the therapeutic dose and the INR measured on it recorded;
     (ii) build X from demographics, anthropometrics, BMI, the eight clinical
     indications, comorbidities and concomitant medications, smoking, and the
-    CYP2C9 / VKORC1 -1639 genotypes; (iii) drop near-constant columns and
+    CYP2C9 / VKORC1 -1639 genotypes, each categorical one-hot encoded against
+    its REFERENCE_LEVELS level; (iii) drop near-constant columns and
     patients with a missing or degenerate BMI. Every column is then centred and
     scaled to unit variance.
 
@@ -281,8 +353,14 @@ def warfarin_policies(ther_dose: np.ndarray,
         The target shift delta, as a multiple of the logging policy's CONDITIONAL
         standard deviation sigma_T sqrt(1 - theta). delta_scale = 1 is the
         calibrated default: the mean-preserving target then has exactly sqrt(2)
-        times the conditional action spread, with effective sample size about
-        65% of n. delta_scale = 2 collapses the overlap (ESS about 7%).
+        times the conditional action spread. Measured effective sample size for
+        the mean-preserving target is about 68% of n at the cohort size and 63% at
+        n = 20000; delta_scale = 2 collapses it to about 3%. The `shift` target is
+        materially worse overlapped at equal delta_scale (about 37%).
+        delta_scale = 0 is the null -- every family degenerates to the logging
+        policy -- and delta_scale = 1 / sqrt(1 - theta), i.e. sqrt(2) at
+        theta = 0.5, reproduces the appendix's shift unit Delta = sigma_T (see
+        the module docstring).
     target : {"mean_preserving", "shift", "shifted_mixture"}
 
     Returns
@@ -356,7 +434,8 @@ def interventional_cdf(cohort: dict,
                        theta: float = 0.5,
                        delta_scale: float = 1.0,
                        tolerance: float = 0.1,
-                       outcome_noise: float = 0.0,
+                       *,
+                       outcome_noise: float,
                        n_quadrature: int = 16) -> np.ndarray:
     """
     The EXACT interventional outcome CDF F(y) = P(Y(pi) <= y) of this design.
@@ -395,11 +474,17 @@ def interventional_cdf(cohort: dict,
     tolerance : float
         Half-width of the acceptable dosing band, as a fraction of T_i.
     outcome_noise : float
-        Standard deviation of the observation noise added to the cost. The
-        default 0.0 returns the NOISE-FREE law. A positive value convolves F
-        with N(0, outcome_noise^2), treating the atom at zero exactly and the
-        continuous part by Gauss-Hermite quadrature; use it whenever the sample
-        being scored was drawn with the same noise.
+        Standard deviation of the observation noise added to the cost;
+        KEYWORD-ONLY AND REQUIRED. 0.0 returns the NOISE-FREE law, and a positive
+        value convolves F with N(0, outcome_noise^2), treating the atom at zero
+        exactly and the continuous part by Gauss-Hermite quadrature; it has to
+        match the noise the scored sample was drawn with. There is no default
+        because the two laws differ in exactly the place a scalar metric is
+        sensitive to. The noise halves the atom, so at this design's defaults the
+        noise-free and noisy CDFs are 0.048 apart in sup norm and a sample drawn
+        with the sampled default 0.1 scores about that Kolmogorov-Smirnov distance
+        against the noise-free F however good the sampler is -- against 0.020 for
+        a correct 2000-point draw scored on the matching law.
     n_quadrature : int
         Gauss-Hermite nodes for that convolution (ignored when the noise is 0).
 

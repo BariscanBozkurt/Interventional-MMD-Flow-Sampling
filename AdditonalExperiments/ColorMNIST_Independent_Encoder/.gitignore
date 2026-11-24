@@ -1,0 +1,5 @@
+*
+!.gitignore
+!README.md
+!run_independent_encoder.py
+!summarize_results.py

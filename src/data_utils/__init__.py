@@ -4,7 +4,9 @@ from .colormnist import (color_ratio, load_digit_pools, recolor, sample_images,
                          sample_interventional, sample_observed, to_image_range,
                          to_model_range)
 from .decfm import sample_decfm_2d_data
-from .dsprites import load_dsprite_bank, sample_cpme_dsprite_data
+from .dsprites import (load_dsprite_bank, rotated_context_gaussian,
+                       sample_confounded_dsprite_data,
+                       sample_cpme_dsprite_data)
 from .dsprites_multifactor import (SHAPE_DIRECTIONS, colour_ratio,
                                    coloured_policies, load_multifactor_bank,
                                    multifactor_policies, render_bilinear,

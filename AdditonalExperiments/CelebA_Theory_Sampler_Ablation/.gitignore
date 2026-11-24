@@ -1,4 +1,7 @@
 cache/
 logs/
-figures/
+figures/*
+!figures/imq_euler_eta0p5/
+figures/imq_euler_eta0p5/*
+!figures/imq_euler_eta0p5/celeba_ranked_pixel_change_top128_both_arms.pdf
 results/

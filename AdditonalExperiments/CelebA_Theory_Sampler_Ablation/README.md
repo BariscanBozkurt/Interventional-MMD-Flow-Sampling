@@ -27,10 +27,24 @@ finite-step condition of the theorem.
 
 ## Current evidence
 
-The complete three-seed comparison is not yet reported. In the seed-0 screening
-run, deterministic IMQ gives arm-averaged pixel SW2 `0.028070`, versus
-`0.028086` for Riesz. Legacy/Clean FID are `11.703/14.901` for IMQ and
-`11.488/14.398` for Riesz. These are pilot values only.
+The paired three-seed comparison is complete (2026-11-22). All 18
+seed/arm/sampler rows pass the completeness and pairing checks. The rerun
+Riesz metrics match the archived headline metrics exactly for all six
+seed/arm pairs. Average arms within seed, then report mean and sample SD
+across seeds:
+
+| Sampler | Pixel SW2 | Legacy FID | Clean FID | Flow seconds/arm |
+|---|---:|---:|---:|---:|
+| Riesz--AdamW | .02656 ± .00155 | 11.57 ± .08 | 14.53 ± .18 | 349.3 ± .1 |
+| IMQ--Euler | .02649 ± .00152 | 11.78 ± .08 | 15.02 ± .18 | 167.9 ± .1 |
+| IMQ--Euler + query noise | .02649 ± .00152 | 11.78 ± .08 | 15.02 ± .18 | 168.9 ± .2 |
+
+Times cover particle optimization only, excluding shared fitting, encoding,
+decoding and evaluation. The IMQ rows have comparable SW2 and modestly worse
+FID. They instantiate the smooth-kernel Euler form without verifying every
+theorem condition. The step size was frozen after the seed-0/arm-0 pilot;
+arm 1 and seeds 1--2 were not used to retune it. Raw outputs and the analyzer's
+report remain private under `results/`.
 
 ## Reproduction
 
@@ -47,6 +61,7 @@ python -m unittest -v \
   AdditonalExperiments.CelebA_Theory_Sampler_Ablation.test_imq_euler
 ```
 
-Use `python <script> --help` for dataset, cache, and output arguments. Results,
-logs, caches, scheduler launchers, and generated face images are excluded from
-the public repository.
+Use `python <script> --help` for dataset, cache, and output arguments. The selected
+[combined initial/final/heatmap PDF](figures/imq_euler_eta0p5/celeba_ranked_pixel_change_top128_both_arms.pdf)
+is included for collaborator review. Results, logs, caches, scheduler launchers
+and other generated face-image files remain local.

@@ -217,9 +217,16 @@ def mean_preserving_mixture(base_policy: GaussianPolicy,
     -delta and +delta with equal weight, so E[a | x] is unchanged and
     Var[a | x] rises by delta^2. Used as the target policy in the stochastic
     policy benchmark; see `GaussianMixturePolicy`.
+
+    delta = 0 is allowed and degenerates harmlessly to `base_policy`: both
+    components then sit on the base mean, so the mixture density is the base
+    density (to round-off -- it is a log-sum-exp over two identical terms) and the
+    density ratio against the base policy is one. It is the null end of a delta
+    ladder, which the plain shifted families admit, so the mean-preserving one
+    must not be the single setting that raises.
     """
-    if not np.isfinite(delta) or delta <= 0.0:
-        raise ValueError("delta must be finite and positive")
+    if not np.isfinite(delta) or delta < 0.0:
+        raise ValueError("delta must be finite and non-negative")
     return GaussianMixturePolicy(base_policy.mean_fn, [-delta, delta], base_policy.scale)
 
 

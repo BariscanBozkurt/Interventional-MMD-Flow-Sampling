@@ -3,6 +3,8 @@
 !README.md
 !run_twenty_seeds.py
 !summarize_results.py
+!run_matched_twenty.py
+!summarize_matched_twenty.py
 !simulation_scripts/
 simulation_scripts/*
 !simulation_scripts/colormnist_dr_mmd_flow_simulation.py

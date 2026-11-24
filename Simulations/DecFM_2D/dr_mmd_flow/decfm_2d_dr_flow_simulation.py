@@ -13,11 +13,147 @@ comparison of forward-Euler RBF flow against AdamW Riesz flow at every configura
 Everything runs on CPU in float64 — there is no GPU code in this experiment, and the
 script has been validated with CUDA hidden.
 
-One CSV row per (data_seed, repeat, arm, sampler): DGP constants, weight diagnostics
-(on-arm ESS, sum of DR weights, per-fold lambdas, kernel lengthscales), the sampler's
-own step/learning-rate, mean transport, and SW1 / SW2 / unbiased RBF MMD^2 against the
+One CSV row per (data_seed, repeat, arm, sampler, estimator): DGP constants, weight
+diagnostics (the ratio's on-arm ESS, and the row estimator's own weight sum, absolute
+sum, Kish ESS, largest atom and on-arm ESS), per-fold lambdas, kernel lengthscales,
+the sampler's own step/learning-rate, mean transport, and SW1 / SW2 / unbiased RBF
+MMD^2 against the
 oracle marginal for the observed arm and the flowed particles, with the
 oracle-vs-oracle floor alongside.
+
+Wall-clock accounting
+---------------------
+Every `seconds_*` column is wall clock (time.time(), rounded to 0.1 s) and belongs to
+exactly ONE of three scopes. Keeping them apart is what makes them addable now that a
+repeat writes many rows instead of one: a cost measured once and written onto every row
+is multiplied by any sum down those rows, and a cost measured outside the repeat clock is
+lost by any sum of repeats.
+
+PER DATA SEED -- identical on every row of every repeat of that data seed, and measured
+OUTSIDE seconds_repeat, because the work happens once before the repeat loop:
+
+    seconds_data        this data seed's data generation: the logged draw and the fixed
+                        2 x --n_ref oracle draw its halves are scored against. This
+                        design loads nothing from disk and holds no model, so there is no
+                        once-per-process cost to charge to the first seed.
+    seconds_setup       the per-data-seed TOTAL, and the column to add once per data
+                        seed. Here it is seconds_data alone: there is no frozen-encoder
+                        pass (seconds_encode) and no shared FID reference feature
+                        (seconds_fid_ref), the two other components seconds_setup is
+                        broken into where a design has them.
+
+SHARED PER REPEAT -- identical on EVERY row of the repeat, so take it ONCE and never
+sum it across rows:
+
+    seconds_ratio       the density-ratio half of the nuisance fit: the DR support
+                        selection, the cross-fitting folds, the logistic propensity fit
+                        and each arm's importance ratios w = 1{a_i = a} / e(a | x_i).
+                        This is the whole of what the IPW estimator needs. The support
+                        and the folds are clocked here because this half consumes them
+                        first; the CME half reuses both.
+    seconds_cme         the conditional-mean-embedding half: the context-kernel median
+                        lock, the Gram blocks, the per-fold ridge selection and each
+                        arm's target action-kernel block with the CME ridge solve that
+                        turns it into the weight vectors. This is the whole of what the
+                        plug-in estimator needs; DR needs both halves. One solve serves
+                        every estimator and sampler of the arm and hands back all of its
+                        vectors at once, so the sub-millisecond IPW rescaling v = w / n
+                        is clocked here too.
+    seconds_nuisance    seconds_ratio + seconds_cme, under the name it has always had.
+                        It is their SUM: never add the three together, and never add the
+                        two halves to seconds_shared. NOTE: until 2026-10-03 this column
+                        stopped at the lambda selection, so an archived CSV's
+                        seconds_nuisance is a smaller quantity and the per-arm solve sat
+                        in the unattributed remainder.
+    seconds_eval_shared the scoring that is independent of the estimator and the sampler
+                        and is therefore done once: the outcome kernel's median lock, the
+                        oracle-vs-oracle floor, its count-matched twin, and each arm's
+                        initial-cloud metrics (accumulated over the two arms)
+    seconds_shared      seconds_nuisance + seconds_eval_shared, as one convenience
+                        column
+
+PER ROW -- this row's own work, so sum freely across rows:
+
+    seconds_flow        this (arm, sampler, estimator) row's flow iterations
+    seconds_eval        this row's OWN scoring: the flowed cloud's SW1 / SW2 / MMD^2
+                        against the oracle reference, and nothing else
+    seconds_sampling    DERIVED, and a term of NEITHER identity below: the isolated cost
+                        of the proposed sampling method for this row, composed for its
+                        estimator out of the columns above --
+                            plugin -> seconds_cme + seconds_flow
+                            ipw    -> seconds_ratio + seconds_flow
+                            dr     -> seconds_ratio + seconds_cme + seconds_flow
+                        (no decode term: the outcome is 2-d and the flow runs in it).
+                        It deliberately EXCLUDES all evaluation, which is measurement
+                        rather than sampling, and the shared starting-particle draw,
+                        which seconds_other carries. Two caveats, both consequences of
+                        the shared columns it is built from: the nuisance halves are
+                        repeat totals over BOTH arms, so run one arm for one arm's
+                        figure; and the outcome-kernel median that the RBF-Euler step
+                        size reads is locked inside seconds_eval_shared, so it is not
+                        counted here. It reuses shared columns, so it must never be
+                        summed down the rows; an end-to-end figure is seconds_setup plus
+                        seconds_repeat, not a sum of this.
+
+TOTAL, and the named remainder:
+
+    seconds_other       exactly the residual of the per-repeat identity below -- the
+                        starting-particle draw, the weight diagnostics and the row
+                        bookkeeping, plus whatever the 0.1 s rounding of the parts
+                        leaves over. A per-repeat constant like the shared columns,
+                        so take it ONCE and never sum it across rows. It can be
+                        slightly negative when that rounding overshoots.
+    seconds_repeat      wall clock of the WHOLE repeat, identical on every row of it.
+                        Not cumulative: it is measured once, when the repeat ends.
+
+The two identities a reader needs, both exact on the rounded numbers the CSV carries:
+
+    seconds_repeat == seconds_shared
+                      + sum over ALL rows of the repeat of
+                            (seconds_flow + seconds_eval)
+                      + seconds_other                                     [per repeat]
+
+    task total     == sum over data seeds of seconds_setup
+                      + sum over repeats of seconds_repeat                [per task]
+
+reading seconds_setup once per data seed and seconds_repeat once per repeat, never once
+per row. What the task identity does not cover is named rather than hidden: process
+start-up (the imports) and the per-repeat CSV rewrite. The run prints both the accounted
+total and the process wall clock on its last line, so the gap is visible rather than
+inferred.
+
+"ALL rows of the repeat" runs over the arm, sampler AND estimator axes at once: this
+design writes 2 arms x |--samplers| x |--estimators| rows per repeat and each one
+carries its own flow and its own scoring, so the sum is over all three axes rather
+than over the estimators alone. There is deliberately NO per-arm or per-sampler shared
+column: work shared inside an arm (that arm's CME solve, that arm's initial-cloud
+metrics) is accumulated over the arms into the per-repeat shared columns, so a repeat
+has exactly one shared total however many arms, samplers and estimators it ran.
+
+Columns this design does NOT write: seconds_ae, seconds_encode, seconds_decode,
+seconds_fid, seconds_fid_ref, seconds_fid_shared. There is no autoencoder, no frozen
+encoder, no decoding step and no FID here, and the convention is to omit a phase a design
+lacks rather than write 0.0 for it.
+
+Everything here runs on CPU in float64, so no torch.cuda.synchronize() is needed before
+any clock is stopped: there is no asynchronous kernel launch whose cost a naive
+time.time() could miss.
+
+Hardware provenance: every row also carries gpu_name (always empty -- this design selects
+no device), hostname, slurm_job_id, slurm_array_task_id, slurm_nodelist, torch_version
+and cuda_version, so a published timing can be tied to the node that produced it. The
+SLURM fields are read from the environment and are empty off the cluster.
+
+Estimator axis (--estimators): the target embedding chi_hat(pi) = sum_i v_i k_Y(y_i, .)
+IS a weight vector, so the plug-in, IPW and DR estimators differ only in the vector
+handed to the flow. All requested estimators share the logged sample, the single
+nuisance solve, the initial particles, the reference and floor draws and the flow
+budget, so the comparison between them carries no seed noise. The default ["dr"]
+reproduces the pre-estimator-axis runs exactly. The IPW row is the Horvitz-Thompson form
+v = w / n by default -- the term that appears inside v_DR, and the reason the three are
+algebraically comparable, but one with no unit mass; --ipw_form hajek switches it to the
+self-normalised w / sum(w), a different estimator, and the form used is recorded in the
+ipw_form CSV column.
 
 Evaluation protocol (2026-09-15, matched to Dance et al.): the DR support is EVERY
 logged row (--n_dr caps it only on request) solved with the Nystrom solver at every n;
@@ -41,6 +177,7 @@ Launched by `submit_decfm_2d_dr_flow_parallel.sh`; single-run example:
 import argparse
 import csv
 import os
+import socket
 import sys
 import time
 from pathlib import Path
@@ -57,26 +194,108 @@ from causality_utils import (cpme_dr_weights, cpme_dr_weights_crossfit,
                              cpme_dr_weights_crossfit_nystrom,
                              cpme_dr_weights_crossfit_projected_nystrom,
                              cpme_dr_weights_projected_nystrom, cpme_dr_weights_nystrom,
-                             lambda_n_half, make_crossfit_fold_ids, select_regularization)
+                             cpme_ipw_weights, lambda_n_half, make_crossfit_fold_ids,
+                             select_regularization)
 from dens_ratio_utils import LogisticPropensityModel, crossfit_propensity
 from mmd_flow_utils import adamw_riesz_flow, mmd_gradient_flow, squared_mmd
 from metric_utils import sliced_wasserstein
 
+#: Report order of the estimator axis. `--estimators` is canonicalised to it, so
+#: neither the row order nor the filename token depends on how the flags were typed.
+ESTIMATORS = ("plugin", "ipw", "dr")
+
 COLUMNS = [
-    "tag", "init", "solver", "n_landmarks", "dr_fit", "lambda_rule",
-    "data_seed", "repeat", "pipeline_seed", "sampler", "target_a",
+    "tag", "init", "solver", "n_landmarks", "dr_fit", "lambda_rule", "ipw_form",
+    "data_seed", "repeat", "pipeline_seed", "sampler", "estimator", "target_a",
     "n_obs", "n_dr", "n_ref", "n_arm", "n_particles_requested", "n_particles",
     "n_floor", "n_floor_matched",
     "confounding_strength", "mixture_delta", "noise_std", "n_folds",
-    "ess_on_arm", "n_on_arm", "sum_v", "sum_abs_v", "fold_lambdas",
+    "ess_on_arm", "n_on_arm",
+    "sum_v", "sum_abs_v", "v_ess", "v_max_abs", "v_ess_on_arm",
+    "fold_lambdas",
     "lengthscale_x", "lengthscale_y",
     "flow_iterations", "step_or_lr", "mean_transport",
     "sw1_initial", "sw2_initial", "mmd2_initial",
     "sw1_flow", "sw2_flow", "mmd2_flow",
     "sw1_floor", "sw2_floor", "mmd2_floor",
     "sw1_floor_matched", "sw2_floor_matched", "mmd2_floor_matched",
-    "seconds_nuisance", "seconds_flow", "seconds_repeat",
+    # Wall clock, in scope order: per DATA SEED first, then shared-per-repeat, then this
+    # row's own, then the total. See the module docstring for which may be summed across
+    # rows and which may not. `seconds_ratio` / `seconds_cme` are a BREAKDOWN of
+    # `seconds_nuisance` and `seconds_data` one of `seconds_setup`, so neither pair may be
+    # added alongside the column it decomposes; `seconds_sampling` is derived from several
+    # of the others and belongs to no sum at all.
+    "seconds_data", "seconds_setup",
+    "seconds_ratio", "seconds_cme", "seconds_nuisance",
+    "seconds_eval_shared", "seconds_shared",
+    "seconds_flow", "seconds_eval", "seconds_sampling",
+    "seconds_other", "seconds_repeat",
+    # Hardware provenance, so a published timing table can be audited against the node
+    # that produced it. See `hardware_provenance`.
+    "gpu_name", "hostname", "slurm_job_id", "slurm_array_task_id", "slurm_nodelist",
+    "torch_version", "cuda_version",
 ]
+
+#: Which half of the nuisance fit each estimator's target embedding actually needs:
+#: v_PI is the CME solve alone, v_IPW = w / n the density ratios alone, and
+#: v_DR = v_PI + v_correction both. Used by `sampling_seconds`.
+SAMPLING_NUISANCE = {"plugin": ("seconds_cme",),
+                     "ipw": ("seconds_ratio",),
+                     "dr": ("seconds_ratio", "seconds_cme")}
+
+
+def hardware_provenance() -> dict:
+    """
+    The machine this run was measured on, as CSV columns.
+
+    A wall-clock table is only auditable against someone else's numbers if the node is
+    recorded with them: these columns say which host and which SLURM allocation produced
+    the row, and which torch/CUDA build ran it.
+
+    Returns
+    -------
+    dict
+        The seven provenance columns. `gpu_name` is always empty: this design runs on CPU
+        in float64 and selects no device, so even on a GPU node none is used. The SLURM
+        entries are empty strings off the cluster, where the variables are simply absent.
+    """
+    return {
+        "gpu_name": "",
+        "hostname": socket.gethostname(),
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID", ""),
+        "slurm_array_task_id": os.environ.get("SLURM_ARRAY_TASK_ID", ""),
+        "slurm_nodelist": os.environ.get("SLURM_JOB_NODELIST", ""),
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda or "",
+    }
+
+
+def sampling_seconds(estimator: str, shared: dict, seconds_flow: float) -> float:
+    """
+    Isolated wall clock of the proposed sampling method for one row.
+
+    The three estimators do not need the same nuisances -- the plug-in expansion needs the
+    CME solve and no ratios, IPW the ratios and no solve, DR both -- so the honest cost of
+    sampling against one of them is its own half of the nuisance fit plus its own flow.
+    Measurement is excluded by construction: no evaluation column enters, and there is no
+    autoencoder or decoder in this design to exclude.
+
+    Parameters
+    ----------
+    estimator : {'plugin', 'ipw', 'dr'}
+    shared : dict
+        The repeat's shared columns, already ROUNDED to 0.1 s, so that the result equals
+        what a reader gets by adding the CSV's own numbers.
+    seconds_flow : float
+        This row's rounded `seconds_flow`.
+
+    Returns
+    -------
+    float
+        Seconds, rounded to 0.1 s.
+    """
+    parts = [shared[column] for column in SAMPLING_NUISANCE[estimator]]
+    return round(sum(parts) + seconds_flow, 1)
 
 
 def write_rows(out_path: Path, rows: list) -> None:
@@ -150,15 +369,29 @@ def parse_args() -> argparse.Namespace:
                         help="flow particles m per arm (capped at the arm size)")
     parser.add_argument("--solver", type=str, default="projected_nystrom",
                         choices=("auto", "exact", "nystrom", "projected_nystrom"),
-                        help="how each fold's CME ridge system is solved. 'auto' (default) "
-                             "solves exactly while affordable and switches to Nystrom above "
-                             "--exact_max_n_obs. The DR support is EVERY logged row either "
-                             "way, so the solver is a tractability detail, not a method "
-                             "variant, and should not appear as a factor in results tables.")
+                        help="how each fold's CME ridge system is solved. "
+                             "'projected_nystrom' (the DEFAULT) tracks the exact "
+                             "solve at every landmark budget measured: DR total mass "
+                             "0.993 to 0.999 against an exact 0.998. 'exact' is that "
+                             "reference, affordable at small n_obs. 'nystrom' is the "
+                             "non-projected Woodbury solve, kept to reproduce archived "
+                             "tables: its weights coarsen as the landmark budget and "
+                             "the ridge shrink -- for every estimator alike, the dr row "
+                             "included -- and asking for it prints a warning carrying "
+                             "the measured masses. 'auto' solves exactly up to "
+                             "--exact_max_n_obs and REFUSES above it rather than "
+                             "exchange the nuisance estimator silently partway through "
+                             "an n_obs sweep. "
+                             "The DR support is EVERY logged row under all of them, "
+                             "so what the choice changes is the nuisance estimate, not "
+                             "the sample, and a results table mixing two solvers is "
+                             "mixing two estimators.")
     parser.add_argument("--exact_max_n_obs", type=int, default=10000,
                         help="largest n_obs for which 'auto' solves exactly; above it a fold "
                              "would be a (4/5 n_obs)^2 float64 system and the Gram alone "
-                             "3.2 GB at n_obs = 20000")
+                             "3.2 GB at n_obs = 20000"
+                             ", and where 'auto' refuses instead of choosing a "
+                             "solver for you")
     parser.add_argument("--n_landmarks", type=int, default=1024,
                         help="Nystrom landmarks per fold")
     parser.add_argument("--n_dr", type=int, default=None,
@@ -168,6 +401,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--samplers", type=str, nargs="+",
                         default=["rbf_euler", "riesz_adamw"],
                         choices=("rbf_euler", "riesz_adamw"))
+    parser.add_argument("--estimators", type=str, nargs="+", default=["dr"],
+                        choices=ESTIMATORS,
+                        help="which target-embedding estimators to flow to, one CSV row "
+                             "each. They are three coefficient vectors over the SAME "
+                             "logged support: 'plugin' uses the conditional mean "
+                             "embedding alone, 'ipw' the density ratios alone, 'dr' their "
+                             "one-step combination v_PI + v_correction. Every requested "
+                             "estimator shares the nuisance solve, the initial particles, "
+                             "the reference draws and the flow budget, so the rows differ "
+                             "only in the target. Default ['dr'] keeps the historical "
+                             "behaviour and the historical arithmetic.")
+    parser.add_argument("--ipw_form", type=str, default="ht", choices=("ht", "hajek"),
+                        help="normalisation of the IPW target embedding, recorded in "
+                             "the ipw_form column. 'ht' (the default) is the "
+                             "Horvitz-Thompson form v = w / n, the term that appears "
+                             "inside v_DR and therefore the one that keeps the three "
+                             "estimators algebraically comparable; it does NOT have "
+                             "unit mass, so read the IPW row's sum_v before reading "
+                             "its metrics -- part of that row's apparent "
+                             "disadvantage is a normalisation artefact rather than "
+                             "an estimation error. 'hajek' is the "
+                             "self-normalised form v = w / sum(w), which sums to one "
+                             "by construction but is a DIFFERENT estimator. It is a "
+                             "normalisation, not a cap on the ratios.")
     parser.add_argument("--confounding_strength", type=float, default=3.0,
                         help="gamma in the logistic propensity")
     parser.add_argument("--mixture_delta", type=float, default=2.0,
@@ -242,6 +499,7 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.flow_iterations is not None:
         args.euler_iterations = args.riesz_iterations = args.flow_iterations
+    args.estimators = [name for name in ESTIMATORS if name in args.estimators]
     return args
 
 
@@ -261,10 +519,192 @@ def write_particle_indices(out_path: Path) -> None:
         np.savez(out_path.with_name(out_path.stem + "_particles.npz"), **PARTICLE_INDICES)
 
 def resolve_solver(args) -> str:
-    """Which ridge solver this configuration uses; see --solver."""
+    """Which ridge solver this configuration uses; see --solver.
+
+    Raises
+    ------
+    SystemExit
+        When `--solver auto` would resolve above --exact_max_n_obs. Resolving there
+        exchanges the exact solve for the non-projected Nystrom one, which is both a
+        change of CME estimator partway through a sweep and a change to a solver whose
+        weights are coarse at small m / n -- `warn_nonprojected_solver` has the
+        numbers. Naming the solver is left to the caller.
+    """
     if args.solver != "auto":
         return args.solver
-    return "exact" if args.n_obs <= args.exact_max_n_obs else "nystrom"
+    if args.n_obs <= args.exact_max_n_obs:
+        return "exact"
+    return "projected_nystrom"
+
+
+def warn_nonprojected_solver(solver: str, n_obs: int, n_landmarks: int) -> None:
+    """
+    Warn that the non-projected Nystrom solve is coarse at this landmark budget.
+
+    The hazard is the SOLVER, and it is the same hazard for every estimator the run
+    reports. `cpme_dr_weights_nystrom` and its cross-fitted twin apply an APPROXIMATE
+    Gram inverse to an exact right-hand side: truncation sets the Gram eigenvalues
+    outside the landmark span to zero, so the exact damping 1 / (mu + lambda) of those
+    directions becomes 1 / lambda, and whatever part of the right-hand side lies there
+    comes back divided by lambda n. That lands on the single DR vector the solver
+    returns by default -- the vector every archived `--solver nystrom` table holds.
+
+    Splitting that vector into (v_PI, v_correction) adds nothing to the problem. The
+    Woodbury operator S(r) = (r - Phi (Phi^T Phi + lam I)^{-1} Phi^T r) / (lam n) is
+    linear, so S(r_PI) + S(r_corr) = S(r_DR) identically; measured, the split agrees
+    with the default single-vector return to 1.5e-12 across the configurations
+    tabulated below.
+
+    Total mass of the returned DR weights -- 1 for the embedding of a probability
+    measure -- on an n = 800, d = 4 bandit with RBF Grams:
+
+        lambda   m/n     exact   nystrom   projected
+        1e-1     0.500   0.9973    0.9984      0.9977
+        1e-1     0.125   0.9973    0.9654      0.9965
+        1e-1     0.062   0.9973    1.0912      0.9930
+        1e-2     0.500   0.9979    1.0006      0.9983
+        1e-2     0.125   0.9979    0.6328      0.9968
+        1e-2     0.062   0.9979    1.9764      0.9934
+        1e-3     0.500   0.9982    1.0073      0.9988
+        1e-3     0.125   0.9982   -2.7062      0.9968
+        1e-3     0.062   0.9982   10.8053      0.9934
+
+    A negative total mass is not the embedding of a probability measure. The damage
+    grows as m / n and lambda shrink, and `projected_nystrom` carries none of it.
+
+    Hence a warning keyed on the solver, and not a refusal keyed on the estimators. A
+    dr-only run has to stay possible on every solver, being what reproduces the
+    archived non-projected tables; and refusing the component split while admitting the
+    DR row would block a computation no less accurate than the one it waves through.
+    `--solver auto` never arrives here: `resolve_solver` refuses rather than switch
+    silently, so the solver is always one the operator named, and the `solver` CSV
+    column records which.
+
+    Parameters
+    ----------
+    solver : str
+        The resolved solver. Anything but 'nystrom' returns silently, as does a budget
+        that spans every logged row, where the factorisation is exact.
+    n_obs : int
+        Logged rows. The CME support is a subset of them, so m / n_obs bounds the
+        m / |support| the solve runs at from below.
+    n_landmarks : int
+        Landmarks per solve.
+    """
+    if solver != "nystrom" or n_landmarks >= n_obs:
+        return
+    print(f"WARNING: --solver nystrom applies an approximate Gram inverse to an exact "
+          f"right-hand side, and its weights coarsen as the landmark budget and the "
+          f"ridge shrink -- for EVERY estimator, the dr row included.\n"
+          f"  Here m = {n_landmarks} landmarks against n_obs = {n_obs}, so the solve "
+          f"runs at m / |support| >= {n_landmarks / n_obs:.3f}; the ridge is whatever "
+          f"--lambda_rule returns, and the error grows as it shrinks.\n"
+          f"  Measured DR total mass at m / n = 0.125: 0.63 at lambda 1e-2 and -2.71 "
+          f"at 1e-3, against 0.998 exact and 0.997 projected.\n"
+          f"  Use --solver projected_nystrom unless this run is reproducing an "
+          f"archived non-projected table.", file=sys.stderr, flush=True)
+
+
+def weight_diagnostics(v: torch.Tensor, on_arm_mask: torch.Tensor) -> dict:
+    """
+    Mass and concentration of one estimator's target weight vector.
+
+    Recorded per estimator, not per repeat: the three put very different profiles on
+    the same logged outcomes -- IPW carries the raw density-ratio tail undamped, the
+    plug-in carries none of it, DR sits between -- and that difference is the finding,
+    so it cannot be a shared column.
+
+    The first four are the CANONICAL per-estimator diagnostics of this repository: the
+    same functionals, under the same names, in the same units, in all five simulations,
+    so an estimator table can be read across designs. Two details are load-bearing.
+    `v_ess` is Kish's ratio of the vector ITSELF, (sum v)^2 / sum v^2 -- on a signed
+    vector (sum |v|)^2 / sum v^2 is a different functional and not a rescaling of it.
+    And `v_max_abs` is the raw largest atom, never multiplied by n.
+
+    `v_ess_on_arm` is specific to this design and named so: the same Kish ratio
+    restricted to the rows logged under the intervened action. It equals `v_ess` for
+    IPW, which is zero off the arm, and differs for the estimators carrying a CME term,
+    so it separates the concentration of the on-arm mass from the signed off-arm spread
+    only those two have. It is not the `ess_on_arm` column, which is that ratio of the
+    IMPORTANCE WEIGHTS on the arm and so takes one value per repeat and arm, whatever
+    estimator the row carries: the two agree on the IPW row, where v is a positive
+    rescaling of w, and part ways on the rows with a CME term.
+
+    Parameters
+    ----------
+    v : torch.Tensor of shape (n,)
+        The estimator's weight vector over the logged outcomes.
+    on_arm_mask : torch.Tensor of shape (n,)
+        Boolean mask of the rows logged under the intervened action.
+
+    Returns
+    -------
+    dict
+        'sum_v' : sum_i v_i, the total mass. chi(pi) is the embedding of a probability
+            measure, so 1 is where a well-behaved estimator lands; the
+            Horvitz-Thompson IPW form w / n does not, which is what --ipw_form records.
+        'sum_abs_v' : sum_i |v_i|, above 'sum_v' exactly when v is signed.
+        'v_ess' : (sum v)^2 / sum v^2, scale invariant. An effective sample size on the
+            non-negative IPW weights; on the SIGNED plug-in and DR vectors a
+            concentration ratio rather than a count, which may exceed n.
+        'v_max_abs' : max_i |v_i|, in the units of v itself, so 1 / n is the
+            uniform-weight reference.
+        'v_ess_on_arm' : 'v_ess' of the on-arm restriction of v.
+    """
+    kish = lambda t: float(t.sum() ** 2 / (t ** 2).sum())
+    return {"sum_v": float(v.sum()), "sum_abs_v": float(v.abs().sum()),
+            "v_ess": kish(v), "v_max_abs": float(v.abs().max()),
+            "v_ess_on_arm": kish(v[on_arm_mask])}
+
+
+def estimator_weights(solve, importance_weights, estimators: list,
+                      ipw_form: str) -> dict:
+    """Target weight vectors for the requested estimators, from ONE nuisance solve.
+
+    The three estimators are the same expansion over the same support with different
+    coefficients, so fitting the nuisances once and reading all three off that fit is
+    what makes their difference the estimators' own rather than the fit's noise.
+
+    Parameters
+    ----------
+    solve : callable
+        ``solve(components)`` returning v_DR when False and the pair
+        (v_PI, v_correction) when True: the configured DR solver with its Gram blocks,
+        lambdas and landmark generator already bound.
+    importance_weights : torch.Tensor of shape (n,)
+        w_i on the DR support. The IPW estimator is w / n and needs nothing else.
+    estimators : list of str
+        Subset of `ESTIMATORS`, in report order.
+    ipw_form : {'ht', 'hajek'}
+        Normalisation of the IPW vector; see --ipw_form. 'ht' is the w / n that appears
+        inside v_DR, so it is the form under which the three rows are one object.
+
+    Returns
+    -------
+    dict
+        Estimator name -> weight vector of shape (n,).
+
+    Notes
+    -----
+    A ["dr"] request takes the solver's own DR right-hand side, so that path is
+    arithmetically the one used before this axis existed; an ["ipw"] request skips the
+    CME solve altogether. Otherwise ONE `components` call serves every requested
+    estimator and v_DR is re-formed as v_PI + v_correction, which agrees with the
+    direct solve to floating point rather than bitwise. The split has to stay inside a
+    single call: the landmark draw is stateful, so two calls could fit two different
+    Nystrom subspaces and the estimators would no longer share a nuisance.
+    """
+    if estimators == ["dr"]:
+        return {"dr": solve(components=False)}
+    if estimators == ["ipw"]:
+        return {"ipw": cpme_ipw_weights(importance_weights,
+                                        normalize=ipw_form == "hajek")}
+    v_plugin, v_correction = solve(components=True)
+    available = {"plugin": v_plugin,
+                 "ipw": cpme_ipw_weights(importance_weights,
+                                         normalize=ipw_form == "hajek"),
+                 "dr": v_plugin + v_correction}
+    return {name: available[name] for name in estimators}
 
 
 def csv_path(args: argparse.Namespace) -> Path:
@@ -290,14 +730,25 @@ def csv_path(args: argparse.Namespace) -> Path:
         suffix += "_nys"
     if (args.euler_iterations, args.riesz_iterations) != (3000, 4000):
         suffix += f"_it{args.euler_iterations}-{args.riesz_iterations}"
+    # The estimator axis multiplies the rows rather than replacing them, so a
+    # multi-estimator run must not land on the dr-only run's filename.
+    if args.estimators != ["dr"]:
+        suffix += "_est" + "-".join(args.estimators)
+    if args.ipw_form != "ht":
+        suffix += f"_ipw{args.ipw_form}"
     name = (f"decfm2d_{args.tag}_nobs{args.n_obs}_M{args.n_particles}"
             f"_gamma{args.confounding_strength:g}_delta{args.mixture_delta:g}"
             f"_sig{args.noise_std:g}_ds{seeds}{suffix}.csv")
     return Path(args.out_dir) / name
 
 
-def run_repeat(data: dict, args: argparse.Namespace, data_seed: int, repeat: int) -> list:
-    """One pipeline pass on a fixed logged sample; one row per (arm, sampler)."""
+def run_repeat(data: dict, setup: dict, args: argparse.Namespace, data_seed: int,
+               repeat: int) -> list:
+    """One pipeline pass on a fixed logged sample; one row per (arm, estimator, sampler).
+
+    `setup` carries this data seed's per-DATA-SEED timing columns, measured in `main`
+    outside this repeat's clock and copied onto every row unchanged.
+    """
     seed = 1000 * data_seed + repeat
     t_start = time.time()
     np.random.seed(seed)
@@ -308,7 +759,9 @@ def run_repeat(data: dict, args: argparse.Namespace, data_seed: int, repeat: int
     A_flat = A_logged.ravel()
     n = len(A_flat)
 
-    # -- shared nuisances on the DR support --------------------------------------------
+    # -- the ratio half of the shared nuisance fit: the DR support, the folds and the
+    # propensity. This is all the IPW estimator needs; the support and the folds are
+    # clocked here because this half consumes them first, and the CME half reuses both.
     t0 = time.time()
     solver = resolve_solver(args)
     # The support is every logged row; --n_dr caps it only when asked for explicitly.
@@ -332,7 +785,11 @@ def run_repeat(data: dict, args: argparse.Namespace, data_seed: int, repeat: int
     else:
         propensity = crossfit_propensity(X_s, A_s_flat, fold_ids,
                                          model_factory=LogisticPropensityModel)
+    seconds_ratio = time.time() - t0
 
+    # -- the CME half: the context kernel, the Gram blocks and the ridge selection. This
+    # is all the plug-in estimator needs, and DR needs both halves.
+    t0 = time.time()
     kernel_x = RBF(use_length_scale_heuristic=True)
     kernel_a = RBF(length_scale=0.5)
     kernel_y = RBF(use_length_scale_heuristic=True)
@@ -340,7 +797,18 @@ def run_repeat(data: dict, args: argparse.Namespace, data_seed: int, repeat: int
     # n_dr^2 pairs is neither affordable nor necessary at n_dr = 20000.
     anchor = torch.randperm(n_dr, generator=torch.Generator().manual_seed(0))[:4000]
     _ = kernel_x(X_s[anchor])
+    seconds_cme = time.time() - t0
+
+    # The OUTCOME kernel is the metric kernel of the MMD^2 columns, so its median lock is
+    # shared evaluation, not nuisance estimation -- as in the Warfarin and ColorMNIST
+    # designs, which lock their metric kernels inside the same clock. The RBF-Euler step
+    # size reads the same locked lengthscale, which is why seconds_sampling says it does
+    # not cover that median.
+    t0 = time.time()
     _ = kernel_y(Y_logged)   # median locked on the FULL logged sample, as in the notebooks
+    seconds_eval_shared = time.time() - t0
+
+    t0 = time.time()
 
     def gram_x(rows, cols):
         "K_X block alone; K_pi needs it without the action factor."
@@ -372,11 +840,15 @@ def run_repeat(data: dict, args: argparse.Namespace, data_seed: int, repeat: int
         if args.dr_fit == "nosplit":
             pick = torch.randperm(n_dr, generator=torch.Generator().manual_seed(0))[:2000].numpy()
             nosplit_lambda, _ = select_regularization(gram(pick, pick), Y_s[pick, 0], seed=0)
-    seconds_nuisance = time.time() - t0
+    # Each arm's target action-kernel block and its CME ridge solve are timed into this
+    # same accumulator inside the arm loop below: they are the rest of the one CME fit
+    # every row of the repeat shares.
+    seconds_cme += time.time() - t0
 
     base = {
         "tag": args.tag, "init": args.init, "solver": solver,
         "dr_fit": args.dr_fit, "lambda_rule": args.lambda_rule,
+        "ipw_form": args.ipw_form,
         "n_landmarks": (args.n_landmarks
                         if solver in ("nystrom", "projected_nystrom") else 0),
         "data_seed": data_seed, "repeat": repeat, "pipeline_seed": seed,
@@ -388,7 +860,10 @@ def run_repeat(data: dict, args: argparse.Namespace, data_seed: int, repeat: int
         "fold_lambdas": ";".join(f"{fold}:{lam:g}" for fold, lam in sorted(fold_lambdas.items())),
         "lengthscale_x": float(kernel_x.length_scale),
         "lengthscale_y": float(kernel_y.length_scale),
-        "seconds_nuisance": round(seconds_nuisance, 1),
+        # Identical on every row of every repeat of this data seed, and measured outside
+        # this repeat's clock: the second term of the per-task identity.
+        **setup,
+        **hardware_provenance(),
     }
 
     def evaluate(cloud, reference=None):
@@ -400,7 +875,9 @@ def run_repeat(data: dict, args: argparse.Namespace, data_seed: int, repeat: int
         }
 
     n_floor = len(Y_oracle_2)
+    t0 = time.time()
     floor = evaluate(Y_oracle_2)      # second independent reference draw vs the first
+    seconds_eval_shared += time.time() - t0
 
     matched_floors: dict = {}
 
@@ -437,9 +914,18 @@ def run_repeat(data: dict, args: argparse.Namespace, data_seed: int, repeat: int
 
     rows = []
     for target_a in (0, 1):
+        # This arm's importance ratios: the ratio half's share of the arm. One set serves
+        # every estimator and sampler on the arm, so it is shared work rather than any
+        # row's own, and it accumulates into seconds_ratio over the two arms.
+        t0 = time.time()
         e_a = propensity if target_a == 1 else 1.0 - propensity
         w_hat = (A_s_flat == target_a).double() / e_a
         on_arm = w_hat[A_s_flat == target_a]
+        seconds_ratio += time.time() - t0
+
+        # This arm's target action-kernel block and the CME ridge solve behind every one
+        # of its weight vectors: the CME half's share of the arm.
+        t0 = time.time()
         if solver in ("nystrom", "projected_nystrom"):
             # K_A_pi[i, j] = k_A(a_i, a) is the same for every column j, so K_pi's
             # blocks are K_X blocks scaled row-wise.
@@ -447,26 +933,33 @@ def run_repeat(data: dict, args: argparse.Namespace, data_seed: int, repeat: int
             gram_pi = lambda rows, cols: (gram_x(rows, cols)
                                           * target_column[rows][:, None])
             if args.dr_fit == "nosplit":
-                solve = (cpme_dr_weights_projected_nystrom
-                         if solver == "projected_nystrom" else cpme_dr_weights_nystrom)
-                v_dr = solve(
+                nystrom_solve = (cpme_dr_weights_projected_nystrom
+                                 if solver == "projected_nystrom" else cpme_dr_weights_nystrom)
+                solve = lambda components: nystrom_solve(
                     gram, gram_pi, w_hat, nosplit_lambda,
                     n_landmarks=args.n_landmarks,
-                    generator=torch.Generator().manual_seed(seed))
+                    generator=torch.Generator().manual_seed(seed),
+                    components=components)
             else:
-                solve = (cpme_dr_weights_crossfit_projected_nystrom
-                         if solver == "projected_nystrom" else cpme_dr_weights_crossfit_nystrom)
-                v_dr = solve(
+                nystrom_solve = (cpme_dr_weights_crossfit_projected_nystrom
+                                 if solver == "projected_nystrom" else cpme_dr_weights_crossfit_nystrom)
+                solve = lambda components: nystrom_solve(
                     gram, gram_pi, w_hat, fold_ids, fold_lambdas,
                     n_landmarks=args.n_landmarks,
-                    generator=torch.Generator().manual_seed(seed))
+                    generator=torch.Generator().manual_seed(seed),
+                    components=components)
         else:
             K_a_target = kernel_a(A_s, torch.full((n_dr, 1), float(target_a)))
             if args.dr_fit == "nosplit":
-                v_dr = cpme_dr_weights(K_x, K_a, K_a_target, w_hat, nosplit_lambda)
+                solve = lambda components: cpme_dr_weights(
+                    K_x, K_a, K_a_target, w_hat, nosplit_lambda, components=components)
             else:
-                v_dr = cpme_dr_weights_crossfit(K_x, K_a, K_a_target, w_hat, fold_ids,
-                                                fold_lambdas)
+                solve = lambda components: cpme_dr_weights_crossfit(
+                    K_x, K_a, K_a_target, w_hat, fold_ids, fold_lambdas,
+                    components=components)
+        weight_vectors = estimator_weights(solve, w_hat, args.estimators,
+                                           args.ipw_form)
+        seconds_cme += time.time() - t0
 
         arm_idx = torch.nonzero(A_flat == target_a).ravel()
         n_particles = min(args.n_particles, len(arm_idx))
@@ -484,63 +977,108 @@ def run_repeat(data: dict, args: argparse.Namespace, data_seed: int, repeat: int
         # and an --init sweep recorded nothing about where the Gaussian arms began. Under
         # --init observed this is now the sampled arm subset rather than the full arm, so it
         # is also counted consistently with the flow row it is compared against.
+        t0 = time.time()
         initial_metrics = evaluate(init)
         # the count the flowed cloud is actually scored at (sliced_wasserstein truncates)
         n_matched = min(n_particles, len(Y_oracle))
         floor_matched = matched_floor(n_matched)
+        # Both are copied into every row of this arm, so their cost is shared scoring;
+        # `matched_floor` is cached, so the second arm usually adds nothing.
+        seconds_eval_shared += time.time() - t0
 
-        for sampler in args.samplers:
-            t0 = time.time()
-            if sampler == "rbf_euler":
-                step = args.step_factor * kernel_y.length_scale.item() ** 2
-                flowed, _ = mmd_gradient_flow(kernel_y, Y_s, init.clone(),
-                                              step_size=step,
-                                              n_iterations=args.euler_iterations,
-                                              target_weights=v_dr, verbose=False)
-                iterations, step_or_lr = args.euler_iterations, step
-            else:
-                torch.manual_seed(seed + 1)
-                flowed, _ = adamw_riesz_flow(init.clone(), Y_s, target_weights=v_dr,
-                                             n_iterations=args.riesz_iterations,
-                                             learning_rate=args.learning_rate,
-                                             warmup_steps=args.warmup_steps,
-                                             lr_schedule="cosine", betas=(0.9, 0.999),
-                                             verbose=False)
-                iterations, step_or_lr = args.riesz_iterations, args.learning_rate
+        # Both samplers and every estimator start from `init`, and the budget below is
+        # the same for all of them, so a row pair differs only in its target weights.
+        for estimator, v_target in weight_vectors.items():
+            for sampler in args.samplers:
+                t0 = time.time()
+                if sampler == "rbf_euler":
+                    step = args.step_factor * kernel_y.length_scale.item() ** 2
+                    flowed, _ = mmd_gradient_flow(kernel_y, Y_s, init.clone(),
+                                                  step_size=step,
+                                                  n_iterations=args.euler_iterations,
+                                                  target_weights=v_target, verbose=False)
+                    iterations, step_or_lr = args.euler_iterations, step
+                else:
+                    torch.manual_seed(seed + 1)
+                    flowed, _ = adamw_riesz_flow(init.clone(), Y_s, target_weights=v_target,
+                                                 n_iterations=args.riesz_iterations,
+                                                 learning_rate=args.learning_rate,
+                                                 warmup_steps=args.warmup_steps,
+                                                 lr_schedule="cosine", betas=(0.9, 0.999),
+                                                 verbose=False)
+                    iterations, step_or_lr = args.riesz_iterations, args.learning_rate
+                seconds_flow = time.time() - t0
 
-            row = dict(base)
-            row.update({
-                "sampler": sampler, "target_a": target_a,
-                "n_arm": int(len(arm_idx)), "n_particles": int(n_particles),
-                "n_floor": int(n_floor), "n_floor_matched": int(n_matched),
-                "ess_on_arm": float(on_arm.sum() ** 2 / (on_arm ** 2).sum()),
-                "n_on_arm": int(len(on_arm)),
-                "sum_v": float(v_dr.sum()), "sum_abs_v": float(v_dr.abs().sum()),
-                "flow_iterations": iterations, "step_or_lr": float(step_or_lr),
-                "mean_transport": float((flowed - init).norm(dim=1).mean()),
-                "seconds_flow": round(time.time() - t0, 1),
-            })
-            row.update({f"{key}_initial": value for key, value in initial_metrics.items()})
-            row.update({f"{key}_flow": value for key, value in evaluate(flowed).items()})
-            row.update({f"{key}_floor": value for key, value in floor.items()})
-            row.update({f"{key}_floor_matched": value
-                        for key, value in floor_matched.items()})
-            rows.append(row)
+                # This row's OWN scoring: the flowed cloud and nothing else. The
+                # initial-cloud and floor metrics below were scored once and shared.
+                t0 = time.time()
+                flow_metrics = evaluate(flowed)
+                seconds_eval = time.time() - t0
 
+                row = dict(base)
+                row.update({
+                    "sampler": sampler, "estimator": estimator, "target_a": target_a,
+                    "n_arm": int(len(arm_idx)), "n_particles": int(n_particles),
+                    "n_floor": int(n_floor), "n_floor_matched": int(n_matched),
+                    "ess_on_arm": float(on_arm.sum() ** 2 / (on_arm ** 2).sum()),
+                    "n_on_arm": int(len(on_arm)),
+                    **weight_diagnostics(v_target, A_s_flat == target_a),
+                    "flow_iterations": iterations, "step_or_lr": float(step_or_lr),
+                    "mean_transport": float((flowed - init).norm(dim=1).mean()),
+                    "seconds_flow": round(seconds_flow, 1),
+                    "seconds_eval": round(seconds_eval, 1),
+                })
+                row.update({f"{key}_initial": value
+                            for key, value in initial_metrics.items()})
+                row.update({f"{key}_flow": value for key, value in flow_metrics.items()})
+                row.update({f"{key}_floor": value for key, value in floor.items()})
+                row.update({f"{key}_floor_matched": value
+                            for key, value in floor_matched.items()})
+                rows.append(row)
+
+    # Round FIRST and take the residual from the ROUNDED parts, so the identity in the
+    # module docstring closes exactly on the numbers the CSV carries rather than only on
+    # the raw floats a reader never sees.
     seconds_repeat = round(time.time() - t_start, 1)
+    seconds_ratio = round(seconds_ratio, 1)
+    seconds_cme = round(seconds_cme, 1)
+    seconds_nuisance = round(seconds_ratio + seconds_cme, 1)
+    seconds_eval_shared = round(seconds_eval_shared, 1)
+    seconds_shared = round(seconds_nuisance + seconds_eval_shared, 1)
+    seconds_own = round(sum(row["seconds_flow"] + row["seconds_eval"]
+                            for row in rows), 1)
+    # The trailing + 0.0 turns the -0.0 that float subtraction yields when the parts
+    # cancel exactly into a plain 0.0, so the CSV reads "0.0" and not "-0.0".
+    seconds_other = round(seconds_repeat - seconds_shared - seconds_own, 1) + 0.0
+    shared = {"seconds_ratio": seconds_ratio, "seconds_cme": seconds_cme,
+              "seconds_nuisance": seconds_nuisance,
+              "seconds_eval_shared": seconds_eval_shared,
+              "seconds_shared": seconds_shared}
     for row in rows:
-        row["seconds_repeat"] = seconds_repeat
+        row.update(shared)
+        # Derived, and in neither identity: this estimator's own half of the nuisance fit
+        # plus this row's own flow, with no representation and no measurement in it.
+        row["seconds_sampling"] = sampling_seconds(row["estimator"], shared,
+                                                   row["seconds_flow"])
+        row.update({"seconds_other": seconds_other,
+                    "seconds_repeat": seconds_repeat})
     return rows
 
 
 def main() -> None:
     args = parse_args()
+    warn_nonprojected_solver(resolve_solver(args), args.n_obs, args.n_landmarks)
     torch.set_default_dtype(torch.float64)
     out_path = csv_path(args)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"output: {out_path}", flush=True)
 
     rows = []
+    accounted = 0.0
+    # The per-DATA-SEED setup clock, restarted after each seed's repeats. Nothing is
+    # loaded once per process here, so no seed carries another's cost.
+    t_process = time.time()
+    t_setup = t_process
     for data_seed in args.data_seeds:
         data = sample_decfm_2d_data(n_samples=args.n_obs,
                                     confounding_strength=args.confounding_strength,
@@ -554,17 +1092,31 @@ def main() -> None:
                                          noise_std=args.noise_std,
                                          seed=100000 + data_seed)["Y_oracle"]
         data["Y_ref"], data["Y_ref_2"] = reference[:args.n_ref], reference[args.n_ref:]
+        # This seed's whole per-data-seed tier: data generation and nothing else here, so
+        # seconds_setup equals seconds_data. Both sit outside every seconds_repeat.
+        seconds_data = round(time.time() - t_setup, 1)
+        setup = {"seconds_data": seconds_data, "seconds_setup": seconds_data}
+        accounted += seconds_data
         for repeat in range(args.n_repeats):
-            new_rows = run_repeat(data, args, data_seed, repeat)
+            new_rows = run_repeat(data, setup, args, data_seed, repeat)
+            accounted += new_rows[-1]["seconds_repeat"]
             rows.extend(new_rows)
             write_rows(out_path, rows)   # atomic rewrite per repeat: crash-safe
             write_particle_indices(out_path)
             for row in new_rows:
                 print(f"[data_seed {data_seed} repeat {repeat} arm {row['target_a']} "
-                      f"{row['sampler']:11s}] SW2 {row['sw2_initial']:.3f} -> "
+                      f"{row['estimator']:6s} {row['sampler']:11s}] "
+                      f"SW2 {row['sw2_initial']:.3f} -> "
                       f"{row['sw2_flow']:.3f} (floor {row['sw2_floor']:.3f})   "
                       f"sum_v {row['sum_v']:.3f}   {row['seconds_flow']:.0f}s", flush=True)
+        # The next data seed's setup clock starts once this seed's repeats are done.
+        t_setup = time.time()
+    # The per-task identity, printed so the gap it does not cover is visible rather than
+    # inferred: process start-up and the per-repeat CSV rewrite.
     print(f"done: {len(rows)} rows -> {out_path}", flush=True)
+    print(f"accounted {round(accounted, 1)}s = sum(seconds_setup) over data seeds "
+          f"+ sum(seconds_repeat) over repeats, of "
+          f"{time.time() - t_process:.1f}s process wall clock", flush=True)
 
 
 if __name__ == "__main__":

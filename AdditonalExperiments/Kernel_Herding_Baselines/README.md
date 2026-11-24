@@ -4,10 +4,46 @@ This directory compares DR--IMMD Flow with finite-candidate kernel herding at
 the streamlined paper configuration: 20,000 logged observations, 2,000 returned
 samples, both intervention arms, and data seeds 0, 1, and 2.
 
-Kernel herding uses exactly the estimated doubly robust target embedding used by
-the matched flow. Its candidate set is the complete logged outcome support. It
-is therefore a selection method: every returned candidate is an observed latent
-or outcome, and repeated selections are allowed.
+Kernel herding uses exactly the estimated doubly robust target embedding used
+by the matched flow,
+
+$$
+\widehat\chi=\sum_{i=1}^n v_i k(z_i,\cdot).
+$$
+
+Given $p$ previously selected atoms $s_1,\ldots,s_p$, it greedily solves
+
+$$
+s_{p+1}\in\operatorname*{arg\,max}_{z\in\mathcal D}
+\left\{
+\sum_{i=1}^n v_i k(z_i,z)
+-\gamma_p\sum_{j=1}^p k(s_j,z)
+\right\}.
+$$
+
+The target term attracts the next atom toward the fixed DR embedding, while the
+second term discourages repeatedly representing regions already covered by the
+selected atoms. The two implementations differ only in the feasible set and
+how this argmax is solved:
+
+- **Finite-candidate herding** uses
+  $\mathcal D=\{E(Y_1),\ldots,E(Y_n)\}$ for image experiments and evaluates the
+  score at every logged latent. The selected index can either retrieve the
+  original observed image $Y_i$ or be decoded as $D(E(Y_i))$. Repeated indices
+  are allowed, so this is retrieval/resampling rather than unrestricted
+  synthesis. It uses $\gamma_p=1/p$ for $p>0$.
+- **Continuous-domain herding** uses $\mathcal D=\mathbb R^{d_z}$ and
+  approximately solves each non-convex argmax with multistart Adam. Logged
+  latents provide starts and fallbacks but do not constrain the answer. The
+  optimized atom is not restricted to the bank and is decoded, so this is
+  genuine latent-space synthesis. It uses $\gamma_p=1/(p+1)$.
+
+This distinction follows the general discussion in
+[Chen et al. (2026)](https://arxiv.org/abs/2505.20754): candidate restriction
+makes the greedy step tractable but cannot recover atoms outside the pool,
+whereas full-domain herding generally requires a non-convex optimization for
+each atom. That work concerns probability-target quadrature, so it does not by
+itself establish guarantees for our signed DR targets or practical Riesz score.
 
 ## Benchmarks and outputs
 
@@ -35,16 +71,10 @@ that retrieval quality is not confused with decoder quality.
 
 ## Continuous latent-space herding
 
-`continuous_latent_herding.py` implements the continuous latent argmax in CPME
-Algorithm 2 with multistart Adam ascent. The displayed
-Algorithm-2 convention divides the repulsion from the previous `p` atoms by
-`p+1`; the finite-candidate baseline follows the appendix/released-code
-convention and divides by `p`. Both conventions are written to each comparison
-CSV. The logged latent bank supplies only starting points and numerical
-fallbacks. Production continuous-herding runs are unbounded: returned atoms can
-move anywhere in the learned latent space, matching the feasible domain used by
-DR--IMMD Flow. The old padded-box option remains available only to reproduce the
-archived pilot.
+`continuous_latent_herding.py` implements the continuous argmax above. Both
+denominator conventions are written to each comparison CSV. Production runs
+are unbounded, matching the feasible domain used by DR--IMMD Flow. The old
+padded-box option remains available only to reproduce the archived pilot.
 
 The continuous ColorMNIST and CelebA runners produce DR--IMMD Flow,
 finite-candidate herding, and continuous herding in one process. They record

@@ -17,8 +17,93 @@ so an estimator is a weight vector v in R^n. With K = K_X * K_A (Hadamard produc
 of the context and action Gram matrices), K_A_pi[i, j] = k_A(a_i, a~_j) for target
 actions a~_j ~ pi(. | x_j), and importance weights w_i = pi(a_i | x_i) / pi_0(a_i | x_i):
 
-    plug-in:       v_PI = (1/n) (K + lambda I)^{-1} (K_X * K_A_pi) 1
-    doubly robust: v_DR = v_PI + (1/n) [ w - (K + lambda I)^{-1} K w ]
+    plug-in:       v_PI  = (1/n) (K + lambda I)^{-1} (K_X * K_A_pi) 1
+    IPW:           v_IPW = w / n
+    doubly robust: v_DR  = v_PI + (1/n) [ w - (K + lambda I)^{-1} K w ]
+
+so v_DR = v_PI + v_correction with v_correction the second bracket. The plug-in
+estimator uses the conditional mean embedding alone and is consistent only if that
+embedding is; IPW uses the importance weights alone and is consistent only if those
+are; the DR estimator is consistent if EITHER is, which is the reason it exists.
+Reporting the three side by side is what shows the correction earning its place.
+
+Every DR solver below therefore takes a `components` flag: True returns the pair
+(v_PI, v_correction) whose sum is the weight vector the solver returns by default. All
+six support it. The split has to happen INSIDE the solver: the landmark draw is
+stateful, so calling a solver twice with two different right-hand sides would fit two
+different Nystrom subspaces.
+
+WHY THE SPLIT IS EXACT, ON EVERY SOLVER. Each solver maps its right-hand side r through
+an operator that is LINEAR in r, so it cannot matter whether r arrives whole or in two
+pieces. The exact solvers apply (K + lambda I)^{-1}; the projected Nystrom solvers apply
+Phi (Phi^T Phi + rho I)^{-1} G^T to a landmark vector r_L; the non-projected Woodbury
+solvers apply
+
+    S(r) = (r - Phi (Phi^T Phi + lambda I)^{-1} Phi^T r) / (lambda n).
+
+One landmark draw and one factorisation serve both halves, so
+S(r_PI) + S(r_correction) = S(r_DR) identically and the only discrepancy is
+floating-point regrouping. Measured over the grid below, the largest
+|v_PI + v_correction - v_DR| is 1.5e-12. The decomposition is trustworthy on ALL SIX
+solvers, to that tolerance. Whether the SOLVER is trustworthy is a separate question,
+and there the six do not agree.
+
+WHERE THE NON-PROJECTED WOODBURY SOLVERS FAIL. `cpme_dr_weights_nystrom` and
+`cpme_dr_weights_crossfit_nystrom` apply an approximate inverse to an exact right-hand
+side, and the 1/(lambda n) prefactor in S multiplies whatever the landmark subspace
+fails to damp: Nystrom truncation sets the out-of-span Gram eigenvalues mu to zero, so
+the exact damping 1/(mu + lambda) becomes 1/lambda. At small lambda and small m/n that
+term IS the answer -- for EVERY estimator on the axis, the plain DR return included.
+The measurement, at n = 800, d = 4, X ~ N(0, I), A = 0.7 X_1 + eps, target action
+A + 0.5, RBF Grams (lengthscale 2.0 on X, 1.0 on A) and
+w = clamp(exp(-(A~ - A)^2 / 2) normalised, 0.05, 20), reporting the total mass of the
+returned weight vector (the target embedding's mass, which must be about 1 for a
+probability measure):
+
+    lam     m/n    exact    nystrom   projected   |split - default|
+    1e-1    0.500  0.9973   0.9984    0.9977      4.44e-15
+    1e-1    0.125  0.9973   0.9654    0.9965      9.10e-15
+    1e-1    0.062  0.9973   1.0912    0.9930      1.34e-14
+    1e-2    0.500  0.9979   1.0006    0.9983      8.70e-14
+    1e-2    0.125  0.9979   0.6328    0.9968      6.84e-14
+    1e-2    0.062  0.9979   1.9764    0.9934      1.61e-13
+    1e-3    0.500  0.9982   1.0073    0.9988      1.50e-12
+    1e-3    0.125  0.9982  -2.7062    0.9968      9.64e-13
+    1e-3    0.062  0.9982  10.8053    0.9934      1.50e-12
+
+A negative total mass is not the embedding of a probability measure, and neither is
+10.81. The exact solver holds 0.997-0.998 across the grid and the projected one
+0.993-0.999, so the hazard is the SOLVER, not the split: the last column sits at
+floating-point noise in every cell, including the cells where that solver's own DR
+answer is worthless. `tests/nystrom_solver_mass_table.py` regenerates all four columns;
+it is the provenance of the numbers above, and no other measurement in this module
+supersedes them. The three mass columns come back digit for digit; the last column is
+pure regrouping noise, so it comes back at the same order of magnitude rather than the
+same digits (largest 1.2e-12 on the machine this was last run on).
+
+Two further properties of that failure, same design and same script. It is governed by
+the landmark draw rather than by anything the caller sets: over 300 draws at
+lambda = 1e-3 the non-projected mass spans [-17.1, 91.4] at m/n = 0.125 and
+[-117.6, 349.0] at m/n = 0.062, while the projected mass stays inside [0.980, 1.003].
+And it is invisible from inside the solver: the fraction of the right-hand side the
+landmark subspace leaves undamped is 0.018 at m/n = 0.125 and 0.039 at m/n = 0.062,
+against 4e-5 to 2e-3 for the exact solve -- small numbers that only become the whole
+answer after the division by lambda n. That is why this module carries no runtime
+guard; `_woodbury_resolvent` gives the argument.
+
+The projected solvers have no such term: they never form a length-|T| right-hand side,
+and their coefficients b_T = U (U^T U + rho W)^+ r_L stay bounded. They are the default
+in every simulation here and the solvers to use for the estimator axis -- not because
+the split behaves better on them, it is exact everywhere, but because the estimate does.
+
+The exact solvers are sound at every lambda the selector can reach. Against a 60-digit
+mpmath reference at n = 150 the plug-in half's relative error is 2e-14 uniformly for
+lambda from 1e0 down to 1e-8, and the DR error 3e-14, because (K + lambda I)^{-1}
+damps the large directions of K_pi 1 by 1/(mu + lambda) and leaves nothing to amplify.
+On a rank-deficient Gram (saturated indicator kernels, rank 4 at n = 600) the no-split
+pair reproduces its own sum bitwise, and the cross-fitted pair to
+cond(K_TT + lambda I) * eps -- 3e-10 at lambda = 1e-4, 3e-4 at lambda = 1e-10 -- which
+is the ordinary cost of regrouping two solves, on halves that both stay order one.
 
 The regularization convention is (K + lambda I).
 """
@@ -57,11 +142,47 @@ def cpme_plugin_weights(K_x: torch.Tensor,
     return torch.linalg.solve(K + reg_lambda * eye, rhs)
 
 
+def cpme_ipw_weights(importance_weights: torch.Tensor,
+                     normalize: bool = False) -> torch.Tensor:
+    """
+    Inverse-propensity CPME weights v_IPW = w / n.
+
+    The estimator that uses no conditional mean embedding at all: it reweights the
+    logged outcomes and nothing more, so it is consistent exactly when the density
+    ratio is, and it inherits that ratio's tails undamped. It is the natural lower
+    comparison for the DR estimator, which differs from it by the CME residual.
+
+    Parameters
+    ----------
+    importance_weights : torch.Tensor of shape (n,)
+        w_i = pi(a_i | x_i) / pi_0(a_i | x_i).
+    normalize : bool
+        False (the default) gives the Horvitz-Thompson form w / n, which is the term
+        that appears in `v_DR` and therefore the one that makes the three estimators
+        algebraically comparable. True gives the self-normalised (Hajek) form
+        w / sum(w), which sums to one by construction and is usually better behaved
+        under heavy ratio tails -- but it is a different estimator, so a table must
+        say which was used.
+
+    Returns
+    -------
+    torch.Tensor of shape (n,)
+    """
+    weights = importance_weights.reshape(-1)
+    if normalize:
+        total = weights.sum()
+        if float(total) == 0.0:
+            raise ValueError("importance weights sum to zero; cannot self-normalise")
+        return weights / total
+    return weights / len(weights)
+
+
 def cpme_dr_weights(K_x: torch.Tensor,
                     K_a: torch.Tensor,
                     K_a_target: torch.Tensor,
                     importance_weights: torch.Tensor,
-                    reg_lambda: float) -> torch.Tensor:
+                    reg_lambda: float,
+                    components: bool = False):
     """
     Doubly robust (one-step) CPME weights
 
@@ -75,17 +196,25 @@ def cpme_dr_weights(K_x: torch.Tensor,
     Same as `cpme_plugin_weights`, plus:
     importance_weights : torch.Tensor of shape (n,)
         w_i = pi(a_i | x_i) / pi_0(a_i | x_i).
+    components : bool
+        Return the pair (v_PI, v_correction) instead of their sum, so the plug-in
+        estimator and the one-step correction can be scored separately against the
+        same nuisance fit. Their sum reproduces the default return to
+        floating-point precision.
 
     Returns
     -------
-    torch.Tensor of shape (n,)
+    torch.Tensor of shape (n,), or a pair of them when `components`.
     """
     n = K_x.shape[0]
     K = K_x * K_a
     eye = torch.eye(n, dtype=K.dtype, device=K.device)
     v_plugin = torch.linalg.solve(K + reg_lambda * eye, (K_x * K_a_target).mean(dim=1))
     mu_hat_weights = torch.linalg.solve(K + reg_lambda * eye, K @ importance_weights)
-    return v_plugin + (importance_weights - mu_hat_weights) / n
+    correction = (importance_weights - mu_hat_weights) / n
+    if components:
+        return v_plugin, correction
+    return v_plugin + correction
 
 
 def cpme_dr_weights_nystrom(gram,
@@ -94,7 +223,8 @@ def cpme_dr_weights_nystrom(gram,
                             reg_lambda: float,
                             n_landmarks: int = 1024,
                             generator: Optional[torch.Generator] = None,
-                            jitter: float = 1e-8) -> torch.Tensor:
+                            jitter: float = 1e-8,
+                            components: bool = False):
     """
     Full-sample (no-split) DR weights with a Nystrom ridge solve.
 
@@ -114,6 +244,16 @@ def cpme_dr_weights_nystrom(gram,
     amplifies the result, which destroys the weights at the small lambdas the selector
     can return.
 
+    Whitening fixes the conditioning, not the approximation, and THIS SOLVER IS UNSOUND
+    at small lambda and small m / n -- for every estimator it can return, the plain DR
+    weights included. The approximate inverse hands back the out-of-landmark-span part of
+    the right-hand side divided by lambda n, which at a small budget is the whole answer:
+    on the module docstring's design the returned weights carry total mass -2.71 at
+    lambda = 1e-3, m / n = 0.125 and 10.81 at m / n = 0.062, where the exact solve gives
+    0.998 and `cpme_dr_weights_projected_nystrom` 0.993-0.999. Prefer the projected
+    solver. This one is kept because it produced archived results, not because a small
+    m / n is safe on it.
+
     Parameters
     ----------
     gram, gram_pi : callable
@@ -129,10 +269,18 @@ def cpme_dr_weights_nystrom(gram,
         Controls the landmark draw.
     jitter : float
         Relative eigenvalue floor for the landmark Gram.
+    components : bool
+        Return the pair (v_PI, v_correction) instead of their sum, from one landmark
+        draw and one factorisation. Exact: `_woodbury_resolvent` is linear, so the pair
+        reproduces the default return to floating point (1.5e-12 over the module
+        docstring's grid). That makes the split free, not the halves usable -- this
+        solver's error divides unevenly between them and partly cancels in their sum, so
+        either half can sit further from the exact solve than the DR vector the same call
+        returns. Use `cpme_dr_weights_projected_nystrom` for the estimator axis.
 
     Returns
     -------
-    torch.Tensor of shape (n,)
+    torch.Tensor of shape (n,), or a pair of them when `components`.
     """
     import numpy as np
 
@@ -142,24 +290,24 @@ def cpme_dr_weights_nystrom(gram,
     lam = float(reg_lambda)
 
     # rhs = K_pi 1 - K w, accumulated in column blocks exactly as the cross-fitted
-    # solver does, so neither n x n matrix is ever held.
-    rhs = _blocked_rhs(gram, gram_pi, rows, rows, weights)
+    # solver does, so neither n x n matrix is ever held. Under `components` the same
+    # accumulation runs once per half; the solve below is shared.
+    if components:
+        rhs_plugin = _blocked_rhs(gram, gram_pi, rows, rows, weights, term="plugin")
+        rhs_correction = _blocked_rhs(gram, gram_pi, rows, rows, weights,
+                                      term="correction")
+    else:
+        rhs = _blocked_rhs(gram, gram_pi, rows, rows, weights)
 
     m = min(n_landmarks, n)
     order = torch.randperm(n, generator=generator)[:m].numpy()
     landmarks = rows[np.sort(order)]
     U = gram(rows, landmarks)
     K_ll = gram(landmarks, landmarks)
-    eigenvalues, eigenvectors = torch.linalg.eigh(K_ll)
-    keep = eigenvalues > jitter * float(eigenvalues.max().clamp_min(0.0))
-    if not bool(keep.any()):
-        raise ValueError("landmark Gram is numerically zero")
-    eigenvalues, eigenvectors = eigenvalues[keep], eigenvectors[:, keep]
-    phi = U @ (eigenvectors / eigenvalues.sqrt())
-    inner = (phi.T @ phi
-             + lam * torch.eye(phi.shape[1], dtype=phi.dtype, device=phi.device))
-    correction = phi @ torch.linalg.solve(inner, phi.T @ rhs)
-    return (rhs - correction) / (lam * n) + weights / n
+    resolvent = _woodbury_resolvent(U, K_ll, lam, n, jitter)
+    if components:
+        return resolvent(rhs_plugin), resolvent(rhs_correction) + weights / n
+    return resolvent(rhs) + weights / n
 
 
 def lambda_n_half(n: int, constant: float = 1.0) -> float:
@@ -199,7 +347,8 @@ def cpme_dr_weights_crossfit(K_x: torch.Tensor,
                              K_a_target: torch.Tensor,
                              importance_weights: torch.Tensor,
                              fold_ids,
-                             reg_lambda) -> torch.Tensor:
+                             reg_lambda,
+                             components: bool = False):
     """
     Cross-fitted doubly robust CPME weights.
 
@@ -235,10 +384,15 @@ def cpme_dr_weights_crossfit(K_x: torch.Tensor,
     reg_lambda : float or dict {fold: float}
         Ridge regularization; a dict gives each fold its own value, selected on that
         fold's training block.
+    components : bool
+        Return the pair (v_PI, v_correction) instead of their sum, aggregated over the
+        same folds. Exact, as on every solver here: the split regroups two solves of one
+        exactly solved fold system, so the pair agrees with the ordinary return to
+        cond(K_TT + lambda I) * eps.
 
     Returns
     -------
-    torch.Tensor of shape (n,)
+    torch.Tensor of shape (n,), or a pair of them when `components`.
     """
     n = K_x.shape[0]
     fold_ids = torch.as_tensor(fold_ids, device=K_x.device).reshape(n)
@@ -251,6 +405,7 @@ def cpme_dr_weights_crossfit(K_x: torch.Tensor,
     K = K_x * K_a
     K_pi = K_x * K_a_target
     v = torch.zeros(n, dtype=K.dtype, device=K.device)
+    v_pi = torch.zeros_like(v)
 
     for fold in folds:
         held_out = fold_ids == fold
@@ -258,9 +413,18 @@ def cpme_dr_weights_crossfit(K_x: torch.Tensor,
         lam = reg_lambda[int(fold)] if isinstance(reg_lambda, dict) else reg_lambda
         K_tt = K[train][:, train]
         eye = torch.eye(K_tt.shape[0], dtype=K.dtype, device=K.device)
+        if components:
+            solve = lambda r: torch.linalg.solve(K_tt + lam * eye, r) / n
+            v_pi[train] += solve(K_pi[train][:, held_out].sum(dim=1))
+            v[train] += solve(-(K[train][:, held_out]
+                                @ importance_weights[held_out]))
+            v[held_out] += importance_weights[held_out] / n
+            continue
         rhs = K_pi[train][:, held_out].sum(dim=1) - K[train][:, held_out] @ importance_weights[held_out]
         v[train] += torch.linalg.solve(K_tt + lam * eye, rhs) / n
         v[held_out] += importance_weights[held_out] / n
+    if components:
+        return v_pi, v
     return v
 
 
@@ -316,18 +480,35 @@ def select_regularization(K: torch.Tensor,
     return best_lambda, cv_errors
 
 
-def _blocked_rhs(gram, gram_pi, train, held_out, importance_weights, block: int = 2048):
+def _blocked_rhs(gram, gram_pi, train, held_out, importance_weights,
+                 block: int = 2048, term: str = "dr"):
     """(K_pi[T, H] 1 - K[T, H] w_H), accumulated over column blocks of H.
 
     Materialising the whole (|T|, |H|) block is what makes the exact solver run out
     of memory at n = 20000; the right-hand side only ever needs column sums, so it
     is accumulated a slice at a time.
+
+    Parameters
+    ----------
+    term : {"dr", "plugin", "correction"}
+        Which right-hand side to accumulate: the full DR one, the plug-in part
+        K_pi[T, H] 1 alone, or the correction part -K[T, H] w_H alone. The "dr"
+        branch keeps both terms inside one accumulation so its arithmetic is
+        unchanged by the existence of the other two; plugin + correction therefore
+        agrees with it to floating-point rather than bitwise.
     """
     total = None
     for start in range(0, len(held_out), block):
         columns = held_out[start:start + block]
-        piece = (gram_pi(train, columns).sum(dim=1)
-                 - gram(train, columns) @ importance_weights[columns])
+        if term == "dr":
+            piece = (gram_pi(train, columns).sum(dim=1)
+                     - gram(train, columns) @ importance_weights[columns])
+        elif term == "plugin":
+            piece = gram_pi(train, columns).sum(dim=1)
+        elif term == "correction":
+            piece = -(gram(train, columns) @ importance_weights[columns])
+        else:
+            raise ValueError(f"unknown term {term!r}")
         total = piece if total is None else total + piece
     return total
 
@@ -339,7 +520,8 @@ def cpme_dr_weights_crossfit_nystrom(gram,
                                      reg_lambda,
                                      n_landmarks: int = 1024,
                                      generator: Optional[torch.Generator] = None,
-                                     jitter: float = 1e-8) -> torch.Tensor:
+                                     jitter: float = 1e-8,
+                                     components: bool = False):
     """
     Nystrom-approximated cross-fitted doubly robust CPME weights.
 
@@ -355,7 +537,12 @@ def cpme_dr_weights_crossfit_nystrom(gram,
     |T| x |T| matrix is formed. That is what makes the DR support the whole logged
     sample rather than a few thousand rows.
 
-    Taking L = T recovers the exact solver up to floating point.
+    Taking L = T recovers the exact solver up to floating point. Below that the
+    approximate inverse returns the out-of-landmark-span part of r_T divided by
+    lambda n, and at small lambda and small m / n that term is the answer -- for the DR
+    weights as much as for either half of them, cross-fitting notwithstanding. The
+    module docstring measures it; `cpme_dr_weights_crossfit_projected_nystrom` is the
+    solver without that term and the one to use.
 
     Parameters
     ----------
@@ -374,10 +561,16 @@ def cpme_dr_weights_crossfit_nystrom(gram,
     jitter : float
         Relative eigenvalue floor for the landmark Gram: components below
         `jitter * max eigenvalue` are dropped when whitening.
+    components : bool
+        Return the pair (v_PI, v_correction) instead of their sum, from one landmark
+        draw per fold. Exact, for the reason given in `_woodbury_resolvent`; but this
+        solver's DR return is poor at small lambda and small m / n, and its halves are no
+        better -- their errors partly cancel in the sum. Use
+        `cpme_dr_weights_crossfit_projected_nystrom` instead.
 
     Returns
     -------
-    torch.Tensor of shape (n,)
+    torch.Tensor of shape (n,), or a pair of them when `components`.
     """
     import numpy as np
 
@@ -391,6 +584,7 @@ def cpme_dr_weights_crossfit_nystrom(gram,
 
     weights = importance_weights
     v = torch.zeros(n, dtype=weights.dtype, device=weights.device)
+    v_pi = torch.zeros_like(v)
     for fold in folds:
         held_out = np.where(fold_ids == fold)[0]
         train = np.where(fold_ids != fold)[0]
@@ -398,7 +592,13 @@ def cpme_dr_weights_crossfit_nystrom(gram,
             raise ValueError("every fold must leave at least two training observations")
         lam = reg_lambda[int(fold)] if isinstance(reg_lambda, dict) else reg_lambda
 
-        rhs = _blocked_rhs(gram, gram_pi, train, held_out, weights)
+        if components:
+            rhs_plugin = _blocked_rhs(gram, gram_pi, train, held_out, weights,
+                                      term="plugin")
+            rhs_correction = _blocked_rhs(gram, gram_pi, train, held_out, weights,
+                                          term="correction")
+        else:
+            rhs = _blocked_rhs(gram, gram_pi, train, held_out, weights)
         m = min(n_landmarks, len(train))
         order = torch.randperm(len(train), generator=generator)[:m].numpy()
         landmarks = train[np.sort(order)]
@@ -406,25 +606,17 @@ def cpme_dr_weights_crossfit_nystrom(gram,
         U = gram(train, landmarks)                       # (|T|, m)
         K_ll = gram(landmarks, landmarks)                # (m, m)
 
-        # Whitened Nystrom features. The naive Woodbury form
-        # (1/lam)[r - U (lam K_LL + U^T U)^{-1} U^T r] is algebraically right but
-        # numerically poor: it squares the Gram's condition number and the 1/lam
-        # prefactor amplifies whatever survives, so a small selected lambda
-        # (select_regularization searches down to 1e-4) can destroy the weights
-        # entirely. Factoring K_LL = V diag(s) V^T and setting Phi = U V s^{-1/2}
-        # gives K_TT ~= Phi Phi^T with the SAME approximation but an inner system
-        # lam I + Phi^T Phi that stays well conditioned for any lambda.
-        eigenvalues, eigenvectors = torch.linalg.eigh(K_ll)
-        keep = eigenvalues > jitter * float(eigenvalues.max().clamp_min(0.0))
-        if not bool(keep.any()):
-            raise ValueError("landmark Gram is numerically zero")
-        eigenvalues, eigenvectors = eigenvalues[keep], eigenvectors[:, keep]
-        phi = U @ (eigenvectors / eigenvalues.sqrt())    # (|T|, k)
-        inner = (phi.T @ phi
-                 + lam * torch.eye(phi.shape[1], dtype=phi.dtype, device=phi.device))
-        correction = phi @ torch.linalg.solve(inner, phi.T @ rhs)
-        v[train] += (rhs - correction) / (lam * n)
+        # One factorisation per fold, applied to each right-hand side the caller
+        # asked for; whitened, see `_woodbury_resolvent`.
+        resolvent = _woodbury_resolvent(U, K_ll, lam, n, jitter)
+        if components:
+            v_pi[train] += resolvent(rhs_plugin)
+            v[train] += resolvent(rhs_correction)
+        else:
+            v[train] += resolvent(rhs)
         v[held_out] += weights[held_out] / n
+    if components:
+        return v_pi, v
     return v
 
 
@@ -452,6 +644,67 @@ def _retained_whitening(K_ll: torch.Tensor, jitter: float):
     if not bool(keep.any()):
         raise ValueError("landmark Gram is numerically zero")
     return eigenvectors[:, keep] / eigenvalues[keep].sqrt()
+
+
+def _woodbury_resolvent(U: torch.Tensor,
+                        K_ll: torch.Tensor,
+                        gram_ridge,
+                        n: int,
+                        jitter: float):
+    """
+    The non-projected Nystrom solve r -> (r - Phi (Phi^T Phi + rho I)^{-1} Phi^T r) / (rho n).
+
+    With W = K_S[L, L] = V_r D_r V_r^T on its retained positive eigenspace and
+    Phi = U V_r D_r^{-1/2}, this is the Woodbury form of (Phi Phi^T + rho I)^{-1} r / n
+    under K_TT ~= Phi Phi^T. It is handed back as a closure because the factorisation is
+    what has to be SHARED: one landmark draw and one eigendecomposition serve however
+    many right-hand sides the caller has, which is what makes the plug-in and correction
+    halves add back up to the DR weights.
+
+    Whitened for conditioning. The naive Woodbury form
+    (1/rho)[r - U (rho W + U^T U)^{-1} U^T r] is algebraically the same but numerically
+    poor: it squares the Gram's condition number and the 1/rho prefactor amplifies
+    whatever survives, so a small selected rho (`select_regularization` searches down to
+    1e-4) can destroy the weights entirely. Factoring W and setting Phi = U V_r D_r^{-1/2}
+    gives the SAME approximation with an inner system rho I + Phi^T Phi that stays well
+    conditioned for any rho.
+
+    The map is LINEAR in r, so there is nothing to decide about splitting r into halves
+    (the module docstring measures the agreement at 1.5e-12) and nothing to warn about
+    either. No threshold on m, on rho or on the returned vector separates this operator's
+    sound regime from its unsound one: the out-of-span fraction of r it fails to damp is
+    a small number, 0.018 at m / n = 0.125, which becomes the whole answer only after the
+    division by rho n, and a guard on m / n would fire on every call the solver exists to
+    serve. This module therefore documents the failure instead of warning about it, and
+    leaves the choice of solver to the caller -- `cpme_dr_weights_projected_nystrom` and
+    its cross-fitted twin have no such term and are what every simulation here selects.
+
+    Parameters
+    ----------
+    U : torch.Tensor of shape (N, m)
+        K_S[T, L], the training-by-landmark Gram block.
+    K_ll : torch.Tensor of shape (m, m)
+        W = K_S[L, L].
+    gram_ridge : float
+        The ridge rho of the unnormalised matrix system.
+    n : int
+        Full sample size, supplying the 1/n of the weight average.
+    jitter : float
+        Relative eigenvalue floor for `K_ll`, see `_retained_whitening`.
+
+    Returns
+    -------
+    callable
+        ``resolvent(r) -> torch.Tensor`` of shape (N,), for r of shape (N,).
+    """
+    phi = U @ _retained_whitening(K_ll, jitter)
+    inner = (phi.T @ phi
+             + gram_ridge * torch.eye(phi.shape[1], dtype=phi.dtype, device=phi.device))
+
+    def resolvent(r):
+        return (r - phi @ torch.linalg.solve(inner, phi.T @ r)) / (gram_ridge * n)
+
+    return resolvent
 
 
 def _projected_nystrom_coefficients(U: torch.Tensor,
@@ -542,7 +795,8 @@ def cpme_dr_weights_crossfit_projected_nystrom(gram,
                                                n_landmarks: int = 1024,
                                                generator: Optional[torch.Generator] = None,
                                                jitter: float = 1e-8,
-                                               landmarks=None) -> torch.Tensor:
+                                               landmarks=None,
+                                               components: bool = False):
     """
     Cross-fitted DR CPME weights with a PROJECTED Nystrom conditional mean embedding.
 
@@ -603,10 +857,16 @@ def cpme_dr_weights_crossfit_projected_nystrom(gram,
         Precomputed landmark rows, bypassing the draw. A dict gives each fold its own
         set; a single array is used for every fold and must lie in each training
         block. Each set must be a subset of that fold's training rows.
+    components : bool
+        Return the pair (v_PI, v_correction) instead of their sum, from one landmark
+        draw per fold, the two halves sharing the fold's factorisation. Exact on every
+        solver in this module; what is specific to the projected pair is that each half
+        is a trustworthy ESTIMATE, the coefficients b_T staying bounded instead of
+        picking up a 1/(lambda n) amplification -- see the module docstring.
 
     Returns
     -------
-    torch.Tensor of shape (n,)
+    torch.Tensor of shape (n,), or a pair of them when `components`.
         v with v[T] += b_T / n and v[H] += w_H / n accumulated over folds.
     """
     import numpy as np
@@ -621,6 +881,7 @@ def cpme_dr_weights_crossfit_projected_nystrom(gram,
 
     weights = importance_weights
     v = torch.zeros(n, dtype=weights.dtype, device=weights.device)
+    v_pi = torch.zeros_like(v)
     for fold in folds:
         held_out = np.where(fold_ids == fold)[0]
         train = np.where(fold_ids != fold)[0]
@@ -631,12 +892,21 @@ def cpme_dr_weights_crossfit_projected_nystrom(gram,
 
         # r_L: the DR right-hand side evaluated at the landmark rows only. This is
         # _blocked_rhs called with landmarks in place of train -- an m-vector.
-        r_L = _blocked_rhs(gram, gram_pi, L, held_out, weights)
         U = gram(train, L)                               # (|T|, m)
         K_ll = gram(L, L)                                # (m, m)
-
-        v[train] += _projected_nystrom_coefficients(U, K_ll, r_L, float(rho), jitter) / n
+        coefficients = lambda r: _projected_nystrom_coefficients(
+            U, K_ll, r, float(rho), jitter) / n
+        if components:
+            v_pi[train] += coefficients(_blocked_rhs(gram, gram_pi, L, held_out,
+                                                     weights, term="plugin"))
+            v[train] += coefficients(_blocked_rhs(gram, gram_pi, L, held_out,
+                                                  weights, term="correction"))
+        else:
+            r_L = _blocked_rhs(gram, gram_pi, L, held_out, weights)
+            v[train] += coefficients(r_L)
         v[held_out] += weights[held_out] / n
+    if components:
+        return v_pi, v
     return v
 
 
@@ -647,7 +917,8 @@ def cpme_dr_weights_projected_nystrom(gram,
                                       n_landmarks: int = 1024,
                                       generator: Optional[torch.Generator] = None,
                                       jitter: float = 1e-8,
-                                      landmarks=None) -> torch.Tensor:
+                                      landmarks=None,
+                                      components: bool = False):
     """
     Full-sample (no-split) DR weights with a PROJECTED Nystrom CME.
 
@@ -679,10 +950,15 @@ def cpme_dr_weights_projected_nystrom(gram,
     jitter : float
     landmarks : array-like, optional
         Precomputed landmark rows, bypassing the draw.
+    components : bool
+        Return the pair (v_PI, v_correction) instead of their sum, from one landmark
+        draw. Exact on every solver in this module; what is specific here is that both
+        halves are trustworthy estimates at small m / n, which on
+        `cpme_dr_weights_nystrom` neither they nor its DR return are.
 
     Returns
     -------
-    torch.Tensor of shape (n,)
+    torch.Tensor of shape (n,), or a pair of them when `components`.
     """
     import numpy as np
 
@@ -691,8 +967,14 @@ def cpme_dr_weights_projected_nystrom(gram,
     rows = np.arange(n)
 
     L = _landmark_indices(rows, n_landmarks, generator, landmarks, fold=0)
-    r_L = _blocked_rhs(gram, gram_pi, L, rows, weights)
     U = gram(rows, L)
     K_ll = gram(L, L)
-    b = _projected_nystrom_coefficients(U, K_ll, r_L, float(reg_lambda), jitter)
-    return b / n + weights / n
+    coefficients = lambda r: _projected_nystrom_coefficients(
+        U, K_ll, r, float(reg_lambda), jitter) / n
+    if components:
+        return (coefficients(_blocked_rhs(gram, gram_pi, L, rows, weights,
+                                          term="plugin")),
+                coefficients(_blocked_rhs(gram, gram_pi, L, rows, weights,
+                                          term="correction")) + weights / n)
+    r_L = _blocked_rhs(gram, gram_pi, L, rows, weights)
+    return coefficients(r_L) + weights / n

@@ -22,6 +22,48 @@ consecutive blocks of 100 vectors and applies 30 updates with the original step
 size. The sum preserves the coefficients' total contribution within a block;
 freezing the spatial derivative within that block is an approximation.
 
+More explicitly, for the random-feature mean
+$\mu_D(Q)=\mathbb E_{Z\sim Q}[\phi_D(Z)]$, the reference cloud minimizes
+
+$$
+F_D(Q)=\frac{1}{2}\left\|
+\mu_D(Q)-\widehat\mu_{\mathrm{target}}
+\right\|_2^2.
+$$
+
+Writing
+
+$$
+Q_r^{\mathrm{ref}}
+=\frac{1}{M_{\mathrm{ref}}}
+ \sum_{j=1}^{M_{\mathrm{ref}}}\delta_{\bar z_j^{(r)}},
+\qquad
+a_r=\widehat\mu_{\mathrm{target}}-\mu_D(Q_r^{\mathrm{ref}}),
+$$
+
+the first variation satisfies
+
+$$
+\nabla_z\frac{\delta F_D}{\delta Q}(z)
+=J_{\phi_D}(z)^\top
+ \left(\mu_D(Q)-\widehat\mu_{\mathrm{target}}\right).
+$$
+
+The negative-gradient Euler update of a reference particle is consequently
+
+$$
+\bar z_j^{(r+1)}
+=\bar z_j^{(r)}
++\eta J_{\phi_D}(\bar z_j^{(r)})^\top a_r.
+$$
+
+Thus $a_r$ is precisely the residual that drives the reference MMD flow. The
+implementation stores this residual before each update and replays the same
+velocity $J_{\phi_D}(z)^\top a_r$ on later query particles. The step size uses
+the mean-field flow convention; relative to the ordinary Euclidean gradient of
+the concatenated reference-particle vector, its additional
+$1/M_{\mathrm{ref}}$ factor is absorbed into the flow-time scaling.
+
 Query particles do not interact. Each request starts from fresh uniform draws
 with replacement from the observed arm's latent bank, and the field and decoder
 remain fixed. This experiment adds no extra learned network or initializer

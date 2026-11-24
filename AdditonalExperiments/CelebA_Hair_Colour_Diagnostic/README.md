@@ -50,6 +50,7 @@ metrics and multipage figure. Run
 python AdditonalExperiments/CelebA_Hair_Colour_Diagnostic/celeba_top128_change_diagnostic.py --help
 ```
 
-for the required dataset and cache arguments. CelebA data, decoded caches,
-ranked CSVs, and face-image figures are deliberately not redistributed in the
-public repository.
+for the required dataset and cache arguments. The selected
+[combined initial/final/heatmap PDF](figures/celeba_ranked_pixel_change_top128_both_arms.pdf)
+is included for collaborator review. CelebA data, decoded caches, ranked CSVs,
+per-page PNGs and duplicate per-arm PDFs remain local regeneration artifacts.
